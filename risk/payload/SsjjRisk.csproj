@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- 正式构建不走这个工程文件：risk\injector.py 的 csc_build() 用游戏自带
+         mscorlib 直接调 Roslyn 编译（游戏 Mono 里没有 netstandard.dll 门面，
+         netstandard2.0 的产物 mono_class_from_name 一律返回 0）。这里只作应急兜底。 -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>SsjjRisk</AssemblyName>
+    <RootNamespace>SsjjRisk</RootNamespace>
+    <LangVersion>7.3</LangVersion>
+    <Deterministic>true</Deterministic>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <DebugType>none</DebugType>
+    <NoWarn>CS0618;CS0649</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Loader.cs" />
+    <Compile Include="WeaponSwapper.cs" />
+  </ItemGroup>
+</Project>

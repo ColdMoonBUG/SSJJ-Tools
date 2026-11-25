@@ -1,0 +1,46 @@
+# ---- 构建产物 / 大文件：不进版本库 ----
+dist/
+build/
+_trash/
+_backups/
+release/
+lobby_res_cache/
+risk_ca/
+risk_payload/
+_shots/
+_snapshots/
+_bundle_test/
+_extract_backup/
+_tools/
+static_backup/
+static_mods/
+*.exe
+*.exe.bak-*
+*.spec
+*.zip
+*.swf
+*.log
+_*.png
+_*.txt
+_*.log
+risk/payload/bin/
+risk/payload/obj/
+risk/proxy/*.obj
+risk/proxy/*.lib
+risk/proxy/_patch*
+**/__pycache__/
+__pycache__/
+
+# ---- 本机账号 / 个人配置 / 私钥：绝不上传 ----
+quick_login.json
+toolbox_settings.json
+risk_config.json
+risk_config.*.json
+risk_exit_*.txt
+risk_https_seen.json
+upstream.json
+
+# ---- 运行期临时文件 ----
+*.dmp
+*.pyc
+.tmp/

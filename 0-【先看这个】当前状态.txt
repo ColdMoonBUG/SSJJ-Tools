@@ -1,0 +1,432 @@
+【当前状态】本地 CDN 加速：清单资源全下完，实际请求 100% 命中
+最后更新：2026-11-23 傍晚（风险模式三块全部实机验证通过：大厅缓动 / 战斗端注入切断自检 / 443 拦截）
+
+
+════════════════════════════════════════════════
+一、现在怎么用
+════════════════════════════════════════════════
+
+双击  1-启动加速并进游戏.bat
+      需要管理员权限，脚本自己弹 UAC。会起服务、查状态、启动游戏。
+
+或者分开来：
+      2-只启动加速服务.bat     只起服务不启动游戏
+      4-查看加速状态.bat        看命中率、回源节点、流量
+      3-停止加速并还原.bat      停服务并把 hosts 改回来
+
+第一次用建议补一遍资源（不补也能玩，就是某些页面第一次进会等下载）：
+      大厅资源-补齐缺失.bat     预下载清单 5264 个 + 补齐上局缺的
+      大厅资源-查看覆盖率.bat   查看还差多少（100% 就是再也不用等）
+
+原理：
+    hosts:  127.0.0.1 cdn.4399ssjj.com
+      :80  → 本地服务
+              命中 lobby_res_cache/ → 直接返回（毫秒级）
+              未命中                → 回源真 CDN，顺手存进库
+      :443 → 纯 TCP 透传真 CDN（TLS 端到端，证书不受影响）
+
+hosts 里那行带 "# ssjj-local-cdn" 标记的记录由脚本管理，不要手动改。
+
+
+════════════════════════════════════════════════
+二、效果（实测数据）
+════════════════════════════════════════════════
+
+资源覆盖：
+  res_config 清单        5264 个资源，已全部下完，缺失 0
+  客户端实际请求过的      731 个唯一资源，已缓存 730，缺失 0（99.9%）
+  本地库总量             8800+ 个文件 / 约 1.7 GB
+
+响应速度（典型）：
+  3.6 MB 大厅主 SWF             0-3 ms（原来每次要下载）
+  GameMon.npz 13.5 MB           13 ms（原来每次启动白下 1.9 秒）
+  hall_config.xml 6 KB          0.7 ms（原来 800 ms+，且带时间戳永不可缓存）
+  角色动画 woman_zip 1.8 MB     已于本地命中
+
+CPU 开销：空闲约 1.4%（单核）。加速服务本身几乎不占资源。
+
+
+════════════════════════════════════════════════
+三、这一轮解决的核心问题：304 空响应
+════════════════════════════════════════════════
+
+现象：一部分小资源（图标、头像、道具格子）每次进都重新拉，日志里是
+      MISS 27-50ms 0B，而且同一个 URL 连续几次都是 0 字节，永远补不进库。
+
+根因：
+  客户端发请求时带 If-Modified-Since 条件头 → 上游回 304 Not Modified
+  （空正文，不重发内容）→ 代理把这空 304 原样转发给客户端 → 但客户端
+  本地其实没有这份文件，拿到空内容 → 重试 → 又是 304 → 死循环。
+
+  实测验证：给同一个 URL 带 If-Modified-Since: 2031 年，上游返回 304 +
+  0 字节；不带这个头，返回 200 + 2339 字节。
+
+修复：回源时剥掉 If-Modified-Since / If-None-Match / If-Range 三个条件头，
+      强制上游返回 200 完整正文，本地才有东西可存。若上游仍然回 304 而
+      本地无副本，自动改用无条件 GET 重取一次。
+
+修复前：item_003_1.swf 等资源 3 次请求全是 0B，永久不命中
+修复后：同样请求（带 2031 年的 If-Modified-Since）返回 200 + 2339B，存库成功
+
+这是冲 100% 命中率的最后一个硬骨头，现在啃掉了。
+
+
+════════════════════════════════════════════════
+四、命中率天花板的说明
+════════════════════════════════════════════════
+
+res_config 清单只覆盖启动必需的 5264 个资源。但客户端还会按需请求一批
+清单里根本没有的资源，已发现 682 个，主要是：
+
+    resource/swf/*                449 个（武器图标、道具图标、展示图）
+    resources/accessory/*          27 个（挂饰模型）
+    resources/lobbyPlayerAnim/*    27 个（大厅角色动画 ← 你说的"左边角色 ui 一动一动"）
+    resources/ui/*                 22 个
+    resources/playerAnim/*         20 个（角色动作包）
+    resources/weapon/*              20 个（武器模型）
+
+这些是服务端下发的动态内容，本地无法提前枚举。对策是「玩一局、补一局」：
+
+  每次服务以 daemon 方式启动时，会在后台静默跑一次 cover：
+  读上一局的 local_cdn.log，把客户端实际请求过、但本地缺失的资源补下来。
+  所以第一局玩到什么，第二局进去那些就全是本地命中。
+
+  这个补齐是后台线程，不阻塞启动、失败也不影响使用。
+
+如果想让某个页面第一次进就不等，先在游戏里点开一次，再跑
+大厅资源-补齐缺失.bat，之后就是毫秒级了。
+
+
+════════════════════════════════════════════════
+五、帧率的结论：别改，没用
+════════════════════════════════════════════════
+
+大厅是 24fps，这是 SWF 头的值，客户端代码里没有任何 stage.frameRate 赋值
+（SWF 里唯一一处 stage.frameRate = 12 是 com.junkbyte.console 的帮助文本）。
+
+三条路都试过，全部不通：
+
+  1. 改 SWF 头帧率 → 客户端卡死。ModuleLoader.as:124-134 会拿文件名里的
+     32 位 md5 校验内容，改了就重载，5 次后 AirLobbyPreloader 停在 178MB
+     不再发任何请求，静默 100 秒以上。
+
+  2. 改 AIR 描述符 <frameRate>60</frameRate> → 确实生效了，但：
+       24fps 空闲 CPU  1.4%
+       60fps 空闲 CPU 24.6%   ← 涨 18 倍
+     视觉上零可感知差别。属于纯亏。
+
+  3. 改缓动曲线 → 要动 DoABC 字节码，同样触发 md5 校验，同上。
+
+  顺带确认：大厅用 GreenSock TweenMax，缓动曲线分布是 Back 501 处、
+  Strong 151 处、Expo 33 处、Linear 只有 4 处。Back 是"过冲到目标再弹回"
+  的曲线，大量 UI 元素同时进出、每个都回弹，整体观感就会毛躁——那才是
+  "不够丝滑"的真正来源，不是帧率。这个改不了，它在编译后的字节码里。
+
+战斗端帧率才是有意义的：进游戏设置里能调到 60-200
+（GameSetting.cs:25-27, FrameLimitMin=60 / FrameLimitMax=200）。
+
+
+════════════════════════════════════════════════
+六、回源节点
+════════════════════════════════════════════════
+
+优先读 Lobby\paras.dat 里的 cdnIp，DoH 兜底，并对候选做真实带宽测速
+（拉 256KB 样本，不是拉几百字节的小文件——用配置文件测出来的只是往返延迟，
+毫无区分度）。
+
+当前节点：171.43.195.116，实测 4750 KB/s
+
+其它测过的节点：
+    42.231.143.36     8188 KB/s   （更快，但当前未选用）
+    157.185.179.12     153 KB/s
+    138.113.128.20      91 KB/s   （DoH 常给这个，极慢）
+
+
+════════════════════════════════════════════════
+七、已知限制
+════════════════════════════════════════════════
+
+1. 443 是纯 TCP 透传。globalResurl 是 https://cdn.4399ssjj.com/global_air，
+   走 443 的资源命中不了本地库，本地无法加速（TLS 由真 CDN 终结）。
+   要加速得做 MITM 装自签根证书，风险和收益不成比例，不做。
+
+2. /ecs/* 是战斗端更新通道（增量补丁、版本号），故意不缓存——缓存住会
+   导致版本升级时拿到旧补丁。它不计入覆盖率统计。
+
+3. gameguard/update.cfg 不缓存：带 id= 参数，内容每次加密不同。
+
+4. 战斗资源（AssetBundle）是另一条链路，不走 local_cdn：
+   %LOCALAPPDATA%\Wooduan\Preload  19.5 GB / 19244 个包，清单 17722 个
+   bundle 缺失 0。客户端自己读本地缓存。
+
+5. 日志超过 8 MB 自动轮转，保留 local_cdn.log.1 / .2 两代。
+
+6. 如果启动器更新了客户端版本，paras.dat 里的 lobbyFileName 会变，
+   res_config 清单的 md5 也会变。届时重跑一次 大厅资源-补齐缺失.bat 即可。
+
+
+════════════════════════════════════════════════
+八、文件说明
+════════════════════════════════════════════════
+
+  local_cdn.py          本地加速服务主体（唯一有效的方案）
+                        run / daemon / status / install / uninstall / fps
+  ssjj_paths.py         公共路径与 paras.dat 读取，各脚本共用
+  exhaustive_fetch.py   资源预下载与补齐
+                        prewarm 按清单下 / cover 按实际请求补齐
+                        fetch 穷举探测 / probe 测速 / stats 统计
+  ssjj_boost.py         命令行入口（status/preload/lobby/gui）
+  gui.py                图形界面，含本地加速服务控制面板
+  core.py               战斗资源下载与校验
+  lobby_cache_tool.py   【已废弃】WinINet 方案，仅留工具函数
+  make_bats.py          bat 的唯一来源，改 bat 请改这里再跑一遍
+  swf_fps.py            读写 SWF 头帧率（诊断用，不要用来改大厅）
+
+  lobby_res_cache/      大厅资源库，加速服务读这个
+  local_cdn.log         运行日志（超 8MB 轮转）
+  upstream.json         回源节点记录
+  cover_failed.json     cover 命令的 404 负缓存（7 天后重试）
+  exhaustive_progress.json  穷举探测进度
+  _trash/               归档的废弃文件，确认不需要了可以整个删掉
+
+
+════════════════════════════════════════════════
+九、风险模式（新增，默认关闭）
+════════════════════════════════════════════════
+
+普通模式只劫持 http。风险模式再多干三件事，详细原理见 风险模式说明.md：
+
+  1. 大厅动效
+     改 Lobby_*.swf 里 DoABC 常量池的 GreenSock 过冲常数（1.70158 / 1.525），
+     定长 8 字节原位替换，不重编译 AS3、文件长度不变。
+     缓存文件按「新内容 md5」命名，正好骗过 ModuleLoader.as 的 md5 校验；
+     paras.dat 的 lobbyFileName 指过去即可，随时可还原。
+     预设：原版 / 轻微 / 柔和 / 丝滑 / 无回弹
+
+  2. 注入与过检测
+     内存注入（VirtualAllocEx + CreateRemoteThread + mono API 反射调用），
+     DLL 不落地、不进模块列表、不建 Overlay 窗口。
+     载荷切断战斗端 RuntimeCheatGuard 的检测线程，并降级 AceClientManager。
+     守护线程见 SSJJ_BattleClient_Unity.exe 就自动注入。
+     已实机验证（2026-11-23）：真起客户端 → 注入成功（class/method/exc 全对），
+     日志里 RuntimeCheatGuard 被改成「_started=true + 线程 Abort + 事件清空 + 8 处方法 ret」，
+     AceClientManager 6 个方法跟着降级。见 %LOCALAPPDATA%\ssjj-toolbox\risk_inject.log
+     载荷必须用游戏自带 mscorlib 编（injector.csc_build()），netstandard2.0 的会被 mono
+     拒绝创建类型（查不到类），别再用 dotnet build 产物替换。
+     联调脚本：python -m risk.livetest（自己起一次战斗端跑完整注入流程）
+
+  3. 全量本地化补完
+     /ecs/*-<32位hash>.patch 这类补丁包开始缓存（每次启动省约 3 秒 / 23 MB）
+     :443 改 MITM（自签根证书 + 叶子证书），https 的 global_air 资源
+     也走同一套本地缓存；未启用时仍是原来的纯透传。
+
+怎么开：
+  工具箱 → 侧栏「风险」页（总开关 / 注入 / 大厅动效 / 本地化 四张卡）
+  或者命令行：python -m risk status | on 柔和 | off | lobby 丝滑 | mitm install
+
+回滚：
+  「全部关闭并还原」或 python -m risk off
+  证书要彻底摘掉：python -m risk mitm off  然后  python -m risk mitm cleanup
+
+风险模式自己的状态（都不会随 PyInstaller 临时目录漂走）：
+  risk_config.json      开关与选项
+  risk_lobby.json       大厅变体清单（还原用）
+  risk_ca\              根证书 / 叶子证书 / 私钥
+  risk_payload\         预编译 SsjjRisk.dll（打包版注入用这个）
+  risk\                 风险模式全部代码（config/paths/swfpatch/airdesc/lobby/
+                        injector/guard/mitm/selftest/payload）
+  build_exe.py          重新打包 生死狙击工具箱.exe（--deploy 直接替换根目录 exe）
+
+十、2026-11-23 晚：修掉「打开就下载/慢」的真凶
+--------------------------------------------
+现象：开游戏就下载资源、点什么都慢。
+根因：443 的 MITM 一直没接上。mitm.enabled() 里探证书靠 subprocess 调 certutil
+      解析输出，打包成 --noconsole 的 exe 后拿不稳 -> 假阴性 -> mitm.enabled()
+      恒 False -> 所有 https 资源走盲透传、从不落盘、每次开游戏都真下载。
+      证据：/__stats__ 里 https 一直涨而 https_mitm 恒 0。
+
+已修（都在源码里，exe 已重新打包部署）：
+1. 探证书改成读注册表
+   HKCU/HKLM\Software\Microsoft\SystemCertificates\Root\Certificates\<缩略码>，
+   certutil 只作兜底。实测 35ms，打包环境不再假阴性。
+2. mitm.enabled() 加 3 秒缓存；local_cdn.handle_https() 入站/出站都设 TCP_NODELAY。
+3. 443 上游连接按 (ip, host) 复用（原来每个未命中都新建 TLS），
+   serve_conn 支持同一条 TLS 连接连拉多个请求。实测 5 个图标：45ms + 1ms*4。
+4. POST/PUT 请求体一律原样转发（以前会被当 GET 发出去，接口会失灵）。
+5. 新增启动接口短缓存 _dyn（TTL 600 秒，SSJJ_DYN_TTL=0 关闭）：
+   /ecs/*/update.php 1244ms -> 18ms
+   /s10/lobby.php     1892ms -> 4ms
+   http 和 https 两条路都接。python local_cdn.py dyncache / dyncache clear
+6. /ecs/ 的 22.3MB 补丁包已进白名单：23MB 从「每次启动 3 秒」变成 33ms 本地命中。
+
+现状：风险模式开启中（大厅缓动变体 + 注入守护 + 443 MITM），
+      80/443 由 生死狙击工具箱.exe --accel-daemon 提供。
+      第一次开游戏仍会把 https 资源拉一遍（同时落盘），第二次起才是秒开。
+
+
+════════════════════════════════════════════════
+十一、2026-11-24 凌晨：三个真问题的修法
+
+1. 只开注入不再要求先开总开关
+   inject_start() / inject_stop() / inject_state() 与总开关解耦，
+   界面注入卡第一行就是「只开注入守护」；工具箱重启时若总开关关着但
+   inject.enabled=True，也会单独把守护拉起来。
+
+2. 权限不再甩一句「需要管理员权限」
+   risk/privilege.py 开 SeDebugPrivilege；injector._open_target() 先试最小权限
+   (0x043A) 再退 ALL_ACCESS，只有真拿到错误 5 才抛 NeedAdmin；
+   守护撞权限会拉起提权副本 `工具箱.exe --risk-inject <pid>`（结果写
+   risk_inject_result.json 由主界面读），界面有「以管理员重启」按钮。
+   顺带修掉 EnumProcessModulesEx 报 299 把整次注入打断的 bug（现在重试 6 次）。
+
+3. 退出卡死：证据 + 三层修
+   看门狗抓到 23:06:43 MicroClient 无响应 56.5 秒，战斗端 23:07:34 退出后
+   immediately 恢复；cdb 打开 dump 显示 UI 线程停在
+   user32!DispatchMessageWorker -> MicroClient+0xcba08 -> ws2_32!select
+   -> mswsock!WSPSelect -> SockWaitForSingleObject
+   —— 即 MicroClient 在窗口消息处理里同步 select() 等对端，客户端能做的是：
+   a) patch AceClientManager.Exit（它 Abort 原生 tick 线程再原生登出，是退出最硬的一步）
+   b) Patch() 保存原字节，ProcessExit 时 RestoreAll() 写回（以前改了就回不去）
+   c) PatchGuardType 加 BannedPatchName 黑名单，Start/Loop/Tick/Run/Update 一律不碰
+   d) 工具箱自身 aboutToQuit → 1.5 秒后 os._exit(0) 兜底
+
+4. 风控 3 分钟的真因：ACE 上报被打掉
+   以前 patch 19 个方法，含 LoginSucc / ReceiveData / SendReport ——
+   服务端看到「这客户端不汇报」就判第三方。现在默认 ace_mode=teardown，
+   只 patch Exit / eixt_ace / user_loginOff_ace / Close 四个退出清理，
+   登录心跳上报全部放行。要回老行为：%LOCALAPPDATA%\ssjj-toolbox\risk_ace_full.txt
+   放一行 full（界面上是「ACE 策略」下拉框）。
+
+5. 「不热加载但更安全」= 三档
+   档0 只开加速/本地化/皮肤包预取（零进程接触，风控无风险）
+   档1 推荐：注入 + 冷加载 + ACE teardown + 退出还原（一次性改内存，之后线程只
+        每 10 秒 stat 一次配置，不碰游戏对象）
+   档2 只在离线/私服：注入 + 热加载 + ACE full
+   冷加载默认开（inject.cold_swap=True），改规则要重进一局才生效。
+   WeaponSwapper 主线程热路径只是字典查表，效果靠 IL Hook 在武器创建瞬间生效。
+
+实测：livetest 注入成功 → 自检 patch 8 处、ACE teardown 4 个、冷加载 rules=3、
+     4 个 IL Hook 全装上；只开注入（总开关 False）1 秒内注入且总开关保持 False；
+     载荷重建 35840 字节，asmscan 确认 RestoreAll/BannedPatchName/AceFullMode 都在。
+
+十一之二、2026-11-24 凌晨追加：注入特征 + 闪退排查
+  · 注入内存拆成「代码区 RX + 数据区 RW」，进程里不再有 RWX 页（日志会打
+    `代码页保护属性复查: RX（RWX 已消除）`）；
+  · mono 复制完程序集后立刻把数据区的 36KB 字节抹 0，内存里不留 PE 头/类型名；
+  · 载荷程序集改名为 risk\payload\bin\System.Configuration.Install.dll
+    （元数据名=文件名，GetAssemblies 里不再出现 SsjjRisk），旧名只作兜底；
+  · 闪退证据：MicroClient 0xc0000005 偏移恒为 0x6c4b9（多为反复 /F 强杀微端后），
+    战斗端那次崩溃故障模块是 npggNT64.des_unloaded（GameGuard 自身卸载期），
+    与注入无关；
+  · 启动前改成先发 WM_CLOSE 优雅关（graceful_close_official），剩下才强杀；
+  · 看门狗默认不抓 dump（写 minidump 会挂起目标全部线程，对带 GameGuard 的战斗端
+    等于自己制造崩溃），要现场才加 --dumps，战斗端另加 --dump-battle；
+  · 实测：打包版自动注入走新路径，WM_CLOSE 后 6 秒内退出并还原 11 个方法首字节。
+
+十一之三、2026-11-24 01:20 追加：换肤链路诊断日志
+  1) risk_inject.log 新增两行自证日志：「见到武器: xxx」（钩子被调用时游戏传进来的武器名，最多 15 个）、「实际替换生效: 皮肤 xxx -> yyy」（规则命中，每把枪只记一次）。
+  2) 实测武器名就是基础名 ak47 / m4a1，规则里直接写这两个即可。
+  3) 人机对局里枪由服务端同步生成，不走玩家换枪 UI，所以看不到「实际替换生效」；真实对局里切换/捡枪后才会跑。
+  4) 载荷已重建为 36864 字节（risk\payload\bin 与 release\risk_payload 同步），exe 已重建部署（53939812B / 01:17:14），release 目录同名 exe 一致。
+
+十一之四、2026-11-24 01:38 追加：换肤命中实证
+  1) 本地私服真实对局连续两局出现「[skin] 实际替换生效: 皮肤 ak47 -> skin_ak47_colorful」，换肤链路端到端跑通（CopyToWeaponComponent 钩子被调用 + 返回目标皮肤名）。
+  2) 之前两局没有命中，真因是打包版内嵌了旧 DLL 覆盖了 risk_payload，钩子里的观测代码没进去；改完载荷必须重建 exe。
+  3) 建模替换（建模/准星/音效那条）要开镜才触发，未测。
+  4) 测试用的临时规则已还原，用户 3 条原始规则不变。
+
+十二、2026-11-24 上午：改成「换肤工具」的默认姿态
+- 首页/导航文案以换肤为主；引导 3 步：只开注入守护 → 选皮肤 → 一键直登。
+- 本地加速、资源缓存、根证书、HTTPS 拦截全部默认关闭；软件启动不再自动拉起加速服务（要开去「加速服务」页手动开）。
+- guard.enable() 不再自动打开 mitm / 装证书，只在配置本来就开启时才准备。
+- 换肤仍是冷加载：进场应用一次、进程内不留常驻线程；改规则需重进一局。
+
+十三、2026-11-24 上午：免安装分发定稿
+- `release\生死狙击工具箱_绿色免安装版.zip`（51.1 MB）内含 exe + 使用说明.txt + 创建桌面快捷方式.bat，解压即用、不写注册表、不装服务。
+- `toolbox/boot.py` 新增 `_writable()` / `fallback_dir()`：打包版在 exe 目录不可写（只读 U 盘、Program Files、压缩包内直接双击）时，配置/载荷/证书/日志自动落到 `%LOCALAPPDATA%\ssjj-toolbox\data`。
+- 皮肤清单已内置进 exe（`--add-data weapon_catalog.json`），别人机器上没有 `D:\Ccode\sjsf` 也能选皮肤。
+- 实机复测（打包版）：默认不启本地加速；首页「换肤优先」文案正常；一键直登 5.9s 进联通二区大厅；私服对局换肤命中（`建模 awm_legend_ct -> verdict_legend1`，皮肤绑定表 5 条）；战斗端 WM_CLOSE 0.5s 退出并 `[restore] 已还原 11 个方法首字节`；工具箱自身 WM_CLOSE 0.9s 全退。
+
+
+十四、2026-11-24 中午：改成「一键启动」，换肤默认走静态（零注入）
+1. 新增「一键启动」页并作为默认首页：选武器 → 选要借用的皮肤 → 填账号区服 → 一键启动
+   （自己写外观、自己登录取 URL、自己拉起客户端）；旁边有「只启动游戏」「一键还原外观」。
+2. 换肤分两层：静态换肤（默认，只改 Preload 里的贴图文件，不碰游戏进程，不需要拥有皮肤）；
+   注入换建模（勾「连建模一起换」才用，会写内存，GameGuard 可能判第三方）。
+3. 新增 toolbox/skin_pack.py（静态换肤 + 备份还原）、toolbox/oneclick.py（一键编排）、
+   toolbox/ui/pages/oneclick.py（页面）、toolbox/data/bundle_index.json（3871 条 武器/皮肤包 -> md5）。
+4. 导航收敛为：一键启动 / 武器皮肤 / 换肤注入 / 本地加速 / 工具。加速与缓存仍全部默认关闭。
+5. 打包新增 UnityPy 及其数据文件（--collect-data UnityPy / fmod_toolkit / archspec），
+   exe 92.9 MB，绿色包 92.4 MB。
+6. 实测：打包版自检里静态换肤 648318→1771615→还原 648318；界面 1274 把武器、ak47 有 13 套皮肤可借。
+7. 注意：静态换肤改的是本机缓存，游戏若重新下载该武器包会被覆盖，重新点一次即可。
+
+十四之二、2026-11-24 下午：一键启动与「武器皮肤」页规则打通
+1. 两边共用 skin_swap.json 的 rules 表，静态规则带 mode=static。
+2. 一键启动换完外观，武器皮肤页表格立刻多一行（状态列 启用·静态）。
+3. 在武器皮肤页删/清规则，会连带还原本地贴图（静态没有运行时）。
+4. 同枪从静态转注入时先还原本地贴图，避免叠加。
+5. 一键启动页会自动回填已有规则（皮肤 + 建模勾选 + 规则来源徽章）。
+6. save_rules 保留 mode 字段（原来会重建白名单丢掉它）。
+
+十四之三、2026-11-24 下午：一键启动页内置「当前规则」表
+1. 新增卡片「当前规则」：方式（静态/注入）· 武器 · 皮肤 · 建模，与武器皮肤页同一份数据。
+2. 双击任意一行 → 自动回到那把枪 + 那套皮肤（并勾上建模状态）。
+3. 三个按钮：删除选中规则（静态会连带还原本地贴图）、全部还原外观、清空全部规则。
+4. 原来「选外观」卡里的重复「一键还原外观」按钮已移除，统一放这张卡里。
+
+十四之四、2026-11-24 下午：一键启动页可「添加规则」
+1. 「当前规则」卡新增按钮「添加当前选择为规则」：选中武器+皮肤点一下就登记，不用启动游戏。
+2. 默认静态：登记规则的同时立刻把本地贴图换掉（进游戏马上看到）。
+3. 勾了「连建模一起换」则登记为注入规则（建模目标请到「武器皮肤」页选）。
+4. 同一把枪再添加会覆盖原来那一条，不会叠加成两条。
+
+十四之五、2026-11-24 下午：加入规则按钮挪到「选外观」卡片里
+1. 按钮改成「加入规则」，放在皮肤下拉右边的同一行，选完立刻能点，不用往下滚。
+2. 「当前规则」卡只留删除 / 全部还原外观 / 清空全部规则。
+3. 顺带修掉一个会「把规则写成空表」的隐患：skin_swap.save_rules 现在拒绝在没有 allow_empty 的情况下把原有规则写空（记 rules_guard.log），并在覆盖前留一份 skin_swap.json.prev。
+
+十四之六、2026-11-24 下午：修好「静态换肤进不去对局」
+1. 根因：战斗端校验 Preload/<md5>/data 的内容 md5 必须等于目录名，就地改文件会 PreloadMd5Mismatch。
+2. 改法：不再改 Preload，改成「本地加速改写 AssetBundle 清单里的 md5/crc/size，并按新 md5 下发改过的包」。
+3. 一键启动在应用静态换肤后会自动开本地加速（hosts 指向 127.0.0.1）。
+4. 之前被就地改过的包已自动还原，md5 与目录名重新一致。
+
+十四之七、2026-11-24 下午：换肤统一走注入
+1. 一键启动只有注入换肤一个模式，静态资源路线停用（避免 Preload md5 校验那套绕法）。
+2. 规则仍是 skin_swap.json 的 rules，战斗端冷加载一次应用，退出还原。
+3. hosts 劫持与本地加速不再参与换肤，已关闭；静态覆盖表与改过的包已全部还原。
+4. 「全部还原外观」会顺手清理 static_mods / static_backup / bundle_overrides.json。
+
+十五、2026-11-24 下午：大厅动效从「风险模式总开关」搬到「大厅帧率」页
+1. 左侧导航恢复「大厅帧率」（一键启动 / 换肤注入 / 大厅帧率 / 本地加速 / 工具）。
+2. 该页新增「大厅动效（缓动曲线）」卡：缓动风格（原版/轻微/柔和/丝滑/无回弹）+「同时套用上面的帧率」（默认勾选）+ 应用/还原。
+3. 总开关只负责换肤注入与检测降级，`guard.disable()` 不再还原大厅。
+4. 大厅帧率默认 60fps（实测 60fps 空闲 CPU 约 24.6%，24fps 约 1.4%，视觉差别很小，自行取舍）。
+5. 产物：exe 97,425,942B / 15:22:13，zip 92.4MB。
+
+
+十六、2026-11-24 深夜：注入方式换成 version.dll 代理（远程线程已被 GameGuard 封死）
+1. 现象：注入必失败。injection_trace.jsonl 证明 CreateRemoteThread 建线程的同一毫秒被
+   npggNT64.des 用 0x80000004 杀掉整个战斗端，载荷一行日志都没跑。
+2. 现在走代理：risk\proxy\version.dll 放进 battle\*_64\（7 个目录都已部署），
+   战斗端启动时被加载，在进程内自己进 mono 调 SsjjRisk.Loader.Load()。
+   不 OpenProcess、不 VirtualAllocEx、不 CreateRemoteThread、不留匿名可执行页。
+3. 界面上「换肤注入 → 高级开关」第一行是「加载方式：代理 DLL」（默认）；
+   旁边有「部署代理」「移除代理」。手动「立即注入一次」在代理模式下会被拒绝。
+4. 退出崩溃：新增 Loader.RestoreEverything()，退出时先撤 4~5 个 IL detour 再还原
+   ret 首字节，然后等 2 秒放行。只还原 ret 不撤 detour 会被 GG 收尾扫描杀。
+5. exe：D:\Ccode\ssjjmeihua\ssjj-tool\生死狙击工具箱.exe（三处哈希一致）、
+   release\生死工具箱1.1.zip。
+
+
+【2026-11-25 13:05 修掉「进对局 1 秒就掉」】
+真凶不是 GameGuard，是游戏自带的 RuntimeCheatGuard：它启动后 30~40 毫秒枚举进程模块，
+拿到 VERSION.dll 的完整路径，发现不在 System32 就上报并让战斗端自己退出
+（error.log: RuntimeCheatGuard:Suspicious proxy DLL is loaded by game process）。
+现在代理 DLL 在自己的 DllMain 里做了三件事：先把真实路径存下来、再 LoadLibrary 钉住系统版
+version.dll（否则伪装后 GetModuleHandle 会命中自己导致无限递归）、然后把 LDR 条目里的
+FullDllName 就地改成 C:\Windows\System32\version.dll、最后立刻摘掉模块链表。
+实测：error.log 的 Suspicious 行不再新增，战斗端 25 秒以上稳定存活（之前 2 秒就没了）。
+代理 61,440 -> 64,000 字节；exe 已重建，根目录 / dist / release\生死工具箱1.1 三份
+SHA256 = 408A6181A81412444812144962AABF7C57E9513F6EE5CC32B837556926B7D1DA。
