@@ -25,6 +25,8 @@ _*.txt
 _*.log
 risk/payload/bin/
 risk/payload/obj/
+tests/**/bin/
+tests/**/obj/
 risk/proxy/*.obj
 risk/proxy/*.lib
 risk/proxy/_patch*

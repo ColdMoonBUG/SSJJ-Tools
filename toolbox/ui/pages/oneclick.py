@@ -5,6 +5,8 @@
 换肤只走注入：规则写进 skin_swap.json，战斗端里的载荷冷加载一次改材质，
 不在进程里留常驻线程，退出时把改过的代码首字节还原。
 """
+import os
+
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit, QPushButton, QSpinBox, QTableWidget,
@@ -221,7 +223,8 @@ class OneclickPage(ScrollPage):
         ar0.setSpacing(10)
         self.cmb_method = QComboBox()
         self.cmb_method.addItem("加载方式：代理 DLL（version.dll · 游戏启动时自加载，最隐蔽）", "proxy")
-        self.cmb_method.addItem("加载方式：远程线程注入（会被 GameGuard 当场杀，仅调试用）", "thread")
+        if str(os.environ.get("SSJJ_ALLOW_THREAD_INJECT") or "").strip() == "1":
+            self.cmb_method.addItem("加载方式：远程线程注入（会被 GameGuard 当场杀，仅调试用）", "thread")
         self.cmb_method.setMinimumWidth(430)
         self.cmb_method.setToolTip(
             "代理 DLL：往 battle\\*_64\\ 放一个 version.dll，战斗端加载器会先加载它，"
@@ -868,6 +871,26 @@ class OneclickPage(ScrollPage):
     def _emit(self, text):
         self.log.line(text)
 
+    def _export_diagnostics(self):
+        destination = choose_diagnostic_path(self)
+        if not destination:
+            return
+        self.btn_export.setEnabled(False)
+        self.log.line("正在导出本次会话诊断日志…")
+
+        def job(_w):
+            try:
+                return True, backend.export_diagnostics(destination)
+            except Exception as exc:
+                return False, repr(exc)
+
+        def done(result):
+            self.btn_export.setEnabled(True)
+            ok, msg = result or (False, "导出未完成")
+            self.log.line(("诊断文件已保存：" if ok else "导出失败：") + str(msg))
+
+        self.run(job, on_done=done)
+
     def _go(self, swap=True):
         if self._busy:
             return
@@ -885,6 +908,12 @@ class OneclickPage(ScrollPage):
         if swap and not has_sel and not self._rules:
             self.log.line("[!] 请先选武器并选择一款皮肤或目标建模（或点「只启动游戏」）")
             return
+        try:
+            import diagnostics
+            diagnostics.record("一键启动请求 swap=%s weapon=%s skin=%s model=%s" %
+                               (swap, weapon, skin, model))
+        except Exception:
+            pass
         if user and pwd and self.chk_remember.isChecked():
             try:
                 quick_login.save_profile(user, pwd, server)
@@ -905,6 +934,11 @@ class OneclickPage(ScrollPage):
         def done(res):
             self._set_busy(False)
             ok, msg = res if isinstance(res, tuple) else (False, "未知结果")
+            try:
+                import diagnostics
+                diagnostics.record("一键启动结束 success=%s" % ok)
+            except Exception:
+                pass
             self.log.line(("[OK] " if ok else "[!] ") + str(msg))
             self.badge_mode.state("ok" if ok else "bad")
             self.badge_mode.setText("完成" if ok else "失败")

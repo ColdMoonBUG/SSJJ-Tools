@@ -16,6 +16,8 @@
   之后先等 mono 出现（最多 WAIT_MONO 秒），超时就跳过这轮等下一轮。
 * 一切路径都走 risk.config，不在这里写死，方便 GUI 改开关。
 """
+import ctypes
+import ctypes.wintypes as wt
 import os
 import sys
 import threading
@@ -24,6 +26,8 @@ import time
 from . import config, injector
 
 POLL_INTERVAL = 1.5
+FAST_POLL_INTERVAL = 0.15
+EXTERNAL_HIDE_FALLBACK_AGE = 1.2   # 仅当模块快照不可用时，至少等 1.2s 才兜底外部隐藏，避免抢在 VBS/慢启动加载 version.dll 之前
 WAIT_MONO = 90.0
 LOG_PATH = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
                         "ssjj-toolbox", "risk_mode.log")
@@ -115,6 +119,18 @@ def last_event():
     return dict(_last)
 
 
+def _allow_thread_inject():
+    return str(os.environ.get("SSJJ_ALLOW_THREAD_INJECT") or "").strip() == "1"
+
+
+def _effective_method():
+    """未显式设置 SSJJ_ALLOW_THREAD_INJECT=1 时一律按 proxy 运行，绝不发起 CreateRemoteThread。"""
+    raw = str(config.get("inject.method") or "proxy").strip().lower()
+    if raw != "proxy" and not _allow_thread_inject():
+        return "proxy"
+    return raw
+
+
 # ------------------------------------------------------------------ 注入
 def inject_now(pid=None, target=None, allow_elevate=True):
     """对已在跑的战斗端注入一次，返回 (ok, 日志行列表)
@@ -123,7 +139,7 @@ def inject_now(pid=None, target=None, allow_elevate=True):
     手动点「立即注入一次」等于把这一局打死。
     """
     target = target or config.get("inject.targets")[0] or injector.DEFAULT_TARGET
-    if str(config.get("inject.method") or "proxy").lower() == "proxy":
+    if _effective_method() == "proxy":
         from . import proxy as _proxy
         n = 0
         try:
@@ -244,47 +260,449 @@ def _elevated_inject(pid, timeout=75):
     return False, "提权副本 %d 秒内没有回话（UAC 可能还在等确认）" % timeout
 
 
+_QUERY_K32 = None
+
+
+def _norm_dir(p):
+    return os.path.normcase(os.path.abspath(os.fspath(p)))
+
+
+def _process_exe_path(pid):
+    """用 PROCESS_QUERY_LIMITED_INFORMATION + QueryFullProcessImageNameW 读取进程路径。"""
+    global _QUERY_K32
+    try:
+        if _QUERY_K32 is None:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.OpenProcess.argtypes = (wt.DWORD, wt.BOOL, wt.DWORD)
+            k.OpenProcess.restype = wt.HANDLE
+            k.QueryFullProcessImageNameW.argtypes = (wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD))
+            k.QueryFullProcessImageNameW.restype = wt.BOOL
+            k.CloseHandle.argtypes = (wt.HANDLE,)
+            k.CloseHandle.restype = wt.BOOL
+            _QUERY_K32 = k
+        h = _QUERY_K32.OpenProcess(0x1000, False, int(pid))
+        if h:
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                sz = wt.DWORD(1024)
+                if _QUERY_K32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(sz)) and buf.value:
+                    return buf.value
+            finally:
+                _QUERY_K32.CloseHandle(h)
+    except Exception:
+        pass
+    try:
+        import psutil
+        exe = psutil.Process(int(pid)).exe()
+        if exe:
+            return exe
+    except Exception:
+        pass
+    return None
+
+
+def _inspect_active_battles(target=None, dirs=None, processes=None):
+    """识别当前活跃战斗端进程及其所在 battle 目录。"""
+    from . import proxy as _proxy
+    target = target or config.get("inject.targets")[0] or injector.DEFAULT_TARGET
+    dirs = list(_proxy.battle_dirs()) if dirs is None else list(dirs)
+    dir_map = {_norm_dir(d): d for d in dirs if d}
+    ps = list(injector.list_processes(target)) if processes is None else list(processes)
+    active = set()
+    pid_dirs = {}
+    unknown_pids = []
+    for p in ps:
+        pid = int(p["pid"])
+        raw_exe = p.get("exe_path") or p.get("path") or ""
+        if not raw_exe:
+            cand = p.get("exe") or ""
+            if "\\" in cand or "/" in cand:
+                raw_exe = cand
+        if not raw_exe:
+            raw_exe = _process_exe_path(pid) or ""
+        if not raw_exe:
+            unknown_pids.append(pid)
+            continue
+        matched = dir_map.get(_norm_dir(os.path.dirname(raw_exe)))
+        if matched:
+            active.add(matched)
+            pid_dirs[pid] = matched
+    if unknown_pids:
+        active.update(dirs)
+    return ps, active, pid_dirs, unknown_pids
+
+
+def active_battle_dirs(dirs=None, processes=None):
+    """返回当前存在活跃 SSJJ_BattleClient_Unity.exe 的 battle 目录集合（解析失败时保守返回全部）。"""
+    _ps, active, _pid_dirs, _unk = _inspect_active_battles(dirs=dirs, processes=processes)
+    return active
+
+
+def _process_age_seconds(pid, first_seen):
+    """返回 (进程已存活秒数, 来源标记)。
+
+    优先读 OS 进程创建时间（GetProcessTimes / psutil），读不到时退回守护首次发现该 pid 的时间，
+    用于在外部兜底改名 version.dll 前确保战斗端已完成本地 DLL 映射。
+    """
+    global _QUERY_K32
+    now_mono = time.monotonic()
+    seen_ts = first_seen.setdefault(pid, now_mono)
+    try:
+        if _QUERY_K32 is None:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.OpenProcess.argtypes = (wt.DWORD, wt.BOOL, wt.DWORD)
+            k.OpenProcess.restype = wt.HANDLE
+            k.QueryFullProcessImageNameW.argtypes = (wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD))
+            k.QueryFullProcessImageNameW.restype = wt.BOOL
+            k.CloseHandle.argtypes = (wt.HANDLE,)
+            k.CloseHandle.restype = wt.BOOL
+            _QUERY_K32 = k
+        if not hasattr(_QUERY_K32, "_ssjj_gpt_bound"):
+            _QUERY_K32.GetProcessTimes.argtypes = (
+                wt.HANDLE,
+                ctypes.POINTER(wt.FILETIME),
+                ctypes.POINTER(wt.FILETIME),
+                ctypes.POINTER(wt.FILETIME),
+                ctypes.POINTER(wt.FILETIME),
+            )
+            _QUERY_K32.GetProcessTimes.restype = wt.BOOL
+            _QUERY_K32._ssjj_gpt_bound = True
+        h = _QUERY_K32.OpenProcess(0x1000, False, int(pid))
+        if h:
+            try:
+                ct, et, kt, ut = wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
+                if _QUERY_K32.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et),
+                                              ctypes.byref(kt), ctypes.byref(ut)):
+                    ft = (int(ct.dwHighDateTime) << 32) | int(ct.dwLowDateTime)
+                    if ft > 116444736000000000:
+                        unix_ct = (ft - 116444736000000000) / 1e7
+                        return max(0.0, time.time() - unix_ct), "os"
+            finally:
+                _QUERY_K32.CloseHandle(h)
+    except Exception:
+        pass
+    try:
+        import psutil
+        ct = float(psutil.Process(int(pid)).create_time())
+        if ct > 0:
+            return max(0.0, time.time() - ct), "psutil"
+    except Exception:
+        pass
+    return max(0.0, now_mono - seen_ts), "seen"
+
+
+class _MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("th32ModuleID", wt.DWORD),
+        ("th32ProcessID", wt.DWORD),
+        ("GlblcntUsage", wt.DWORD),
+        ("ProccntUsage", wt.DWORD),
+        ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+        ("modBaseSize", wt.DWORD),
+        ("hModule", wt.HMODULE),
+        ("szModule", wt.WCHAR * 256),
+        ("szExePath", wt.WCHAR * 260),
+    ]
+
+
+_SNAP_K32 = None
+_TH32CS_SNAPMODULE = 0x00000008
+_TH32CS_SNAPMODULE32 = 0x00000010
+_INVALID_HANDLE = ctypes.c_void_p(-1).value
+_READY_MODULES = ("unityplayer.dll", "mono-2.0-bdwgc.dll")
+
+
+def _has_unity_or_mono_loaded(pid):
+    """只读检查目标 pid 是否已加载 UnityPlayer.dll 或 mono-2.0-bdwgc.dll。
+
+    返回：
+        True  — 已加载（战斗端已完成 version.dll 映射，可安全执行外部兜底隐藏）
+        False — 尚未加载（绝不能提前挪走 version.dll）
+        None  — 权限/系统原因无法枚举模块
+    """
+    global _SNAP_K32
+    try:
+        if _SNAP_K32 is None:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.CreateToolhelp32Snapshot.argtypes = (wt.DWORD, wt.DWORD)
+            k.CreateToolhelp32Snapshot.restype = wt.HANDLE
+            k.Module32FirstW.argtypes = (wt.HANDLE, ctypes.POINTER(_MODULEENTRY32W))
+            k.Module32FirstW.restype = wt.BOOL
+            k.Module32NextW.argtypes = (wt.HANDLE, ctypes.POINTER(_MODULEENTRY32W))
+            k.Module32NextW.restype = wt.BOOL
+            k.CloseHandle.argtypes = (wt.HANDLE,)
+            k.CloseHandle.restype = wt.BOOL
+            _SNAP_K32 = k
+        flags = _TH32CS_SNAPMODULE | _TH32CS_SNAPMODULE32
+        snap = None
+        for _ in range(3):
+            snap = _SNAP_K32.CreateToolhelp32Snapshot(flags, int(pid))
+            if snap and snap != _INVALID_HANDLE:
+                break
+            err = ctypes.get_last_error()
+            if err == 24:  # ERROR_BAD_LENGTH: 进程正在加载模块，短暂重试
+                time.sleep(0.01)
+                continue
+            return None
+        if not snap or snap == _INVALID_HANDLE:
+            return None
+        try:
+            me = _MODULEENTRY32W()
+            me.dwSize = ctypes.sizeof(me)
+            if not _SNAP_K32.Module32FirstW(snap, ctypes.byref(me)):
+                return None
+            while True:
+                if (me.szModule or "").lower() in _READY_MODULES:
+                    return True
+                if not _SNAP_K32.Module32NextW(snap, ctypes.byref(me)):
+                    break
+            return False
+        finally:
+            _SNAP_K32.CloseHandle(snap)
+    except Exception:
+        return None
+
+
+def _probe_battle_process(pid):
+    """只读探针：采集战斗端已加载模块实际路径与进程缓解策略（GetProcessMitigationPolicy）。"""
+    global _SNAP_K32, _QUERY_K32
+    lines = []
+    exe_path = _process_exe_path(pid) or "?"
+    version_hits = []
+    unity_path = "NOT_LOADED"
+    mono_path = "NOT_LOADED"
+    non_sys = []
+    snap_err = None
+
+    try:
+        if _SNAP_K32 is None:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.CreateToolhelp32Snapshot.argtypes = (wt.DWORD, wt.DWORD)
+            k.CreateToolhelp32Snapshot.restype = wt.HANDLE
+            k.Module32FirstW.argtypes = (wt.HANDLE, ctypes.POINTER(_MODULEENTRY32W))
+            k.Module32FirstW.restype = wt.BOOL
+            k.Module32NextW.argtypes = (wt.HANDLE, ctypes.POINTER(_MODULEENTRY32W))
+            k.Module32NextW.restype = wt.BOOL
+            k.CloseHandle.argtypes = (wt.HANDLE,)
+            k.CloseHandle.restype = wt.BOOL
+            _SNAP_K32 = k
+        flags = _TH32CS_SNAPMODULE | _TH32CS_SNAPMODULE32
+        snap = None
+        for _ in range(3):
+            snap = _SNAP_K32.CreateToolhelp32Snapshot(flags, int(pid))
+            if snap and snap != _INVALID_HANDLE:
+                break
+            err = ctypes.get_last_error()
+            if err == 24:
+                time.sleep(0.01)
+                continue
+            snap_err = err
+            break
+        if snap and snap != _INVALID_HANDLE:
+            try:
+                me = _MODULEENTRY32W()
+                me.dwSize = ctypes.sizeof(me)
+                if _SNAP_K32.Module32FirstW(snap, ctypes.byref(me)):
+                    while True:
+                        mod_name = (me.szModule or "").strip()
+                        mod_low = mod_name.lower()
+                        mod_path = (me.szExePath or "").strip()
+                        path_low = mod_path.lower()
+                        base_addr = ctypes.cast(me.modBaseAddr, ctypes.c_void_p).value or 0
+                        if mod_low == "version.dll" or (mod_low.startswith(".ver") and mod_low.endswith(".dat")):
+                            version_hits.append("%s @0x%X (%dB)" % (mod_path or mod_name, base_addr, int(me.modBaseSize)))
+                        if mod_low == "unityplayer.dll":
+                            unity_path = mod_path or mod_name
+                        elif mod_low == "mono-2.0-bdwgc.dll":
+                            mono_path = mod_path or mod_name
+                        if mod_path and not path_low.startswith("c:\\windows\\system32\\") and not path_low.startswith("c:\\windows\\winsxs\\"):
+                            if len(non_sys) < 25:
+                                non_sys.append(mod_path)
+                        if not _SNAP_K32.Module32NextW(snap, ctypes.byref(me)):
+                            break
+            finally:
+                _SNAP_K32.CloseHandle(snap)
+        elif snap_err is None:
+            snap_err = ctypes.get_last_error()
+    except Exception as e:
+        snap_err = repr(e)
+
+    # 进程缓解策略（PROCESS_QUERY_LIMITED_INFORMATION = 0x1000）
+    pol = {}
+    try:
+        if _QUERY_K32 is None:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.OpenProcess.argtypes = (wt.DWORD, wt.BOOL, wt.DWORD)
+            k.OpenProcess.restype = wt.HANDLE
+            k.QueryFullProcessImageNameW.argtypes = (wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD))
+            k.QueryFullProcessImageNameW.restype = wt.BOOL
+            k.CloseHandle.argtypes = (wt.HANDLE,)
+            k.CloseHandle.restype = wt.BOOL
+            _QUERY_K32 = k
+        if not hasattr(_QUERY_K32, "_ssjj_mit_bound"):
+            _QUERY_K32.GetProcessMitigationPolicy.argtypes = (wt.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t)
+            _QUERY_K32.GetProcessMitigationPolicy.restype = wt.BOOL
+            _QUERY_K32._ssjj_mit_bound = True
+        h = _QUERY_K32.OpenProcess(0x1000, False, int(pid))
+        if h:
+            try:
+                for name, code in (("dyn", 2), ("sig", 8), ("img", 10), ("redir", 16)):
+                    val = wt.DWORD(0)
+                    if _QUERY_K32.GetProcessMitigationPolicy(h, code, ctypes.byref(val), ctypes.sizeof(val)):
+                        pol[name] = int(val.value)
+                    else:
+                        pol[name] = "err=%d" % ctypes.get_last_error()
+            finally:
+                _QUERY_K32.CloseHandle(h)
+        else:
+            pol["open_err"] = ctypes.get_last_error()
+    except Exception as e:
+        pol["exc"] = repr(e)
+
+    sig_v = pol.get("sig")
+    img_v = pol.get("img")
+    dyn_v = pol.get("dyn")
+    redir_v = pol.get("redir")
+
+    sig_str = ("0x%X(ms=%d,store=%d,optin=%d)" % (sig_v, sig_v & 1, (sig_v >> 1) & 1, (sig_v >> 2) & 1)
+               if isinstance(sig_v, int) else str(sig_v))
+    img_str = ("0x%X(no_remote=%d,no_low=%d,prefer_sys32=%d)" % (img_v, img_v & 1, (img_v >> 1) & 1, (img_v >> 2) & 1)
+               if isinstance(img_v, int) else str(img_v))
+    dyn_str = ("0x%X" % dyn_v) if isinstance(dyn_v, int) else str(dyn_v)
+    redir_str = ("0x%X" % redir_v) if isinstance(redir_v, int) else str(redir_v)
+
+    ver_summary = "; ".join(version_hits) if version_hits else ("NOT_LOADED" if snap_err is None else "SNAP_ERR(%s)" % snap_err)
+    lines.append("[proxy-probe] pid=%d exe=%s version=%s" % (pid, exe_path, ver_summary))
+    lines.append("[proxy-probe] pid=%d unity=%s mono=%s" % (pid, unity_path, mono_path))
+    lines.append("[proxy-probe] pid=%d image_load=%s sig_policy=%s dyn_code=%s redir_trust=%s"
+                 % (pid, img_str, sig_str, dyn_str, redir_str))
+    if non_sys:
+        lines.append("[proxy-probe] pid=%d non_sys_modules(%d)=%s" % (pid, len(non_sys), " | ".join(non_sys)))
+    return "\n".join(lines)
+
+
+def _clear_appcompat_shims(_proxy):
+    """清理针对 SSJJ_BattleClient_Unity.exe 的 AppCompatFlags\\Layers Shim 并记录日志。"""
+    try:
+        removed = _proxy.clear_battle_appcompat_shims()
+    except Exception:
+        removed = []
+    if removed:
+        desc = "; ".join("%s:%s=%s" % (h, k, v) for h, k, v in removed)
+        log("[proxy] 已清理 Windows 兼容层 Shim (防止抢先加载 System32\\version.dll): %s" % desc)
+    return removed
+
+
 def _watch():
     target = config.get("inject.targets")[0] or injector.DEFAULT_TARGET
     from . import proxy as _proxy
-    mode = str(config.get("inject.method") or "proxy").lower()
+    mode = _effective_method()
     if mode == "proxy":
         log("注入守护启动（代理模式），目标 %s：载荷由 battle\\*_64\\version.dll 在战斗端启动时自加载" % target)
+        _clear_appcompat_shims(_proxy)
     else:
         log("注入守护启动（远程线程模式），目标 %s" % target)
     waiting = {}          # pid -> 首次见到的时间
     mono_ready = {}       # pid -> Mono 首次就绪时间
     seen = set()          # 只记录一次发现过程，避免每轮重复落盘
     fail_counts = {}      # pid -> 连续失败次数（避免受保护子进程无限重试刷日志）
+    hide_warned = set()   # 外部协同隐藏失败只对每个 pid 记一次日志
+    hide_deferred = set() # 暂缓外部隐藏日志只对每个 pid 记一次
+    probed_pids = set()   # 模块与缓解策略探针每个 pid 只采一次
+    first_seen = {}       # pid -> 代理守护首次发现时间（OS 进程时间不可用时的兜底）
+    last_heal = 0.0
     while not _stop.is_set():
         try:
+            mode = _effective_method()
             if not config.get("inject.enabled"):
-                time.sleep(POLL_INTERVAL)
+                _stop.wait(FAST_POLL_INTERVAL if mode == "proxy" else POLL_INTERVAL)
                 continue
-            ps = injector.list_processes(target)
             if mode == "proxy":
-                # 代理模式：什么都不用做，载荷随 version.dll 在进程启动时进来。
-                # 这里只负责记录「这一局已经由代理接管」，让界面显示已生效。
+                dirs = _proxy.battle_dirs()
+                ps, active_dirs, pid_dirs, unknown_pids = _inspect_active_battles(target, dirs=dirs)
+                live_pids = set()
                 for p in ps:
-                    pid = p["pid"]
+                    pid = int(p["pid"])
+                    live_pids.add(pid)
+                    bdir = pid_dirs.get(pid)
+                    loaded = None
+                    need_probe = pid not in probed_pids
+                    has_dll = bool(bdir and os.path.isfile(os.path.join(bdir, _proxy.NAME)))
+                    if need_probe or has_dll:
+                        loaded = _has_unity_or_mono_loaded(pid)
+                    if need_probe:
+                        probe_ready = (loaded is True)
+                        if not probe_ready:
+                            p_age, _ = _process_age_seconds(pid, first_seen)
+                            probe_ready = (p_age >= EXTERNAL_HIDE_FALLBACK_AGE)
+                        if probe_ready:
+                            probed_pids.add(pid)
+                            try:
+                                report = _probe_battle_process(pid)
+                                for pline in report.splitlines():
+                                    log(pline)
+                            except Exception as e:
+                                log("[proxy-probe] pid=%d 探针异常: %r" % (pid, e))
+                    if has_dll:
+                        if loaded is True:
+                            ok_h, detail_h = _proxy.hide_in_dir(bdir)
+                            if ok_h:
+                                log("[proxy] pid=%d UnityPlayer/mono 已就绪仍见 version.dll，外部协同隐藏 -> %s"
+                                    % (pid, detail_h))
+                            elif pid not in hide_warned and "目录中无" not in detail_h and "不在原位" not in detail_h:
+                                hide_warned.add(pid)
+                                log("[proxy] pid=%d 外部协同隐藏失败（%s）: %s" % (pid, os.path.basename(bdir), detail_h))
+                        elif loaded is False:
+                            if pid not in hide_deferred:
+                                hide_deferred.add(pid)
+                                log("[proxy] pid=%d 等待 UnityPlayer/mono 加载，暂缓外部隐藏（避免抢在游戏加载 version.dll 前）"
+                                    % pid)
+                        else:
+                            age, age_src = _process_age_seconds(pid, first_seen)
+                            if age < EXTERNAL_HIDE_FALLBACK_AGE:
+                                if pid not in hide_deferred:
+                                    hide_deferred.add(pid)
+                                    log("[proxy] pid=%d 模块枚举不可用且存活 %.2fs < %.2fs(%s)，暂缓外部隐藏"
+                                        % (pid, age, EXTERNAL_HIDE_FALLBACK_AGE, age_src))
+                            else:
+                                ok_h, detail_h = _proxy.hide_in_dir(bdir)
+                                if ok_h:
+                                    log("[proxy] pid=%d 模块枚举不可用但存活 %.2fs(%s) 仍见 version.dll，兜底外部隐藏 -> %s"
+                                        % (pid, age, age_src, detail_h))
+                                elif pid not in hide_warned and "目录中无" not in detail_h and "不在原位" not in detail_h:
+                                    hide_warned.add(pid)
+                                    log("[proxy] pid=%d 外部协同隐藏失败（%s）: %s" % (pid, os.path.basename(bdir), detail_h))
                     if pid not in _done_pids:
                         _done_pids.add(pid)
                         log("[proxy] pid=%d 战斗端已启动，载荷由 version.dll 代理加载（不做跨进程注入）" % pid)
-                _done_pids.intersection_update({p["pid"] for p in ps} or set())
-                # 没有战斗端在跑时把代理文件补回去：代理线程启动时会把自身改名成
-                # .ver.dat 躲开目录扫描，不补回来下一局就不会加载了。
-                # 代理每局会把自身改名藏起来，所以只要目录里 version.dll 不全就补。
-                # 不再等“一个战斗端都没有”——僵尸进程会让 ps 永远非空，第二局就失效。
-                try:
-                    dirs = _proxy.battle_dirs()
-                    if dirs and len(_proxy.deployed()) < len(dirs):
-                        ok, msg = _proxy.heal()
-                        if ok and "补回 0 个" not in msg and "补回" in msg:
-                            log("[proxy] " + msg)
-                except Exception as e:
-                    log("[proxy] 补回代理失败: %r" % (e,))
-                _stop.wait(POLL_INTERVAL)
+                _done_pids.intersection_update(live_pids)
+                hide_warned.intersection_update(live_pids)
+                hide_deferred.intersection_update(live_pids)
+                probed_pids.intersection_update(live_pids)
+                for dead_pid in list(first_seen):
+                    if dead_pid not in live_pids:
+                        first_seen.pop(dead_pid, None)
+                # 仅对「已无活跃战斗端」的区服目录按 1.5s 节流补回，严禁运行期把活跃目录补回 version.dll。
+                now = time.monotonic()
+                if dirs and (now - last_heal) >= POLL_INTERVAL:
+                    last_heal = now
+                    if not unknown_pids:
+                        active_norm = {_norm_dir(d) for d in active_dirs}
+                        idle_dirs = [d for d in dirs if _norm_dir(d) not in active_norm]
+                        if idle_dirs:
+                            try:
+                                deployed_norm = {_norm_dir(d) for d in _proxy.deployed()}
+                                if any(_norm_dir(d) not in deployed_norm for d in idle_dirs):
+                                    ok, msg = _proxy.heal(skip_dirs=active_dirs)
+                                    if ok and "补回 0 个" not in msg and "补回" in msg:
+                                        log("[proxy] " + msg)
+                                        _clear_appcompat_shims(_proxy)
+                            except Exception as e:
+                                log("[proxy] 补回代理失败: %r" % (e,))
+                _stop.wait(FAST_POLL_INTERVAL)
                 continue
+            ps = injector.list_processes(target)
             live = set()
             for p in ps:
                 pid = p["pid"]
@@ -419,7 +837,7 @@ def inject_state():
     return {
         "enabled": bool(config.get("inject.enabled")),
         "auto": bool(config.get("inject.auto")),
-        "method": str(config.get("inject.method") or "proxy"),
+        "method": _effective_method(),
         "thread_alive": bool(_thread and _thread.is_alive()),
         "target": target,
         "processes": pids,
@@ -444,11 +862,12 @@ def inject_start(elevate=False):
     """
     from . import privilege
     config.set_("inject.enabled", True)
-    mode = str(config.get("inject.method") or "proxy").lower()
+    mode = _effective_method()
     note = ""
     if mode == "proxy":
         try:
             from . import proxy as _proxy
+            _clear_appcompat_shims(_proxy)
             # 上一局结束时代理会把自己改名成 .ver.dat 躲自检，所以每次开守护都先补回
             _proxy.heal(emit=log)
             st = _proxy.status()

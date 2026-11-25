@@ -17,6 +17,11 @@ import boot
 
 DATA = boot.bootstrap()
 
+
+def export_diagnostics(destination):
+    import diagnostics
+    return diagnostics.export(destination)
+
 import ssjj_paths as P
 import local_cdn as C
 import swf_fps
@@ -590,18 +595,7 @@ def autostart_state():
 
 def autostart(add):
     if add:
-        tr = " ".join('"%s"' % a for a in _self_cmd(["--accel-daemon"]))
-        try:
-            r = subprocess.run(["schtasks", "/Create", "/F", "/TN", TASK_NAME,
-                                "/SC", "ONLOGON", "/RL", "HIGHEST", "/TR", tr],
-                               capture_output=True, text=True, encoding="gbk",
-                               errors="replace", timeout=20,
-                               creationflags=0x08000000)
-        except Exception as e:
-            return False, "创建计划任务失败：%r" % (e,)
-        if r.returncode != 0:
-            return False, (r.stderr or r.stdout or "schtasks 返回 %d" % r.returncode).strip()
-        return True, "已创建登录时自动启动的计划任务（最高权限，无弹窗）"
+        return False, "开机自启已永久关闭"
     try:
         subprocess.run(["schtasks", "/Delete", "/F", "/TN", TASK_NAME],
                        capture_output=True, timeout=15,
@@ -818,6 +812,12 @@ def shutdown_all(emit=None):
             note("已关闭 %s" % label)
         except Exception as e:
             note("关闭 %s 失败：%r" % (label, e))
+    # 退出时自动清理 battle\*_64\ 下属于本工具的代理残留，避免关闭工具箱后仍被游戏拦截
+    try:
+        ok_p, msg_p = _risk_mod("proxy").uninstall(emit=lambda s: note("[proxy] " + str(s)))
+        note("退出清理代理（%s）：%s" % ("完成" if ok_p else "部分失败", msg_p))
+    except Exception as e:
+        note("退出清理代理失败：%r" % (e,))
     # hosts 兜底还原：accel_stop 里那一步万一没跑成，绝不能让用户网络留在劫持状态
     try:
         if C._hosts_has_mark():
@@ -887,6 +887,13 @@ def risk_proxy_install(all_dirs=True, emit=None):
 
 
 def risk_proxy_uninstall(emit=None):
+    # 避免移除时守护线程马上 heal()，或下次启动按旧设置重新部署。
+    risk_inject_stop()
+    save_app_setting("risk_enabled", False)
+    try:
+        _risk_mod("guard").disable()
+    except Exception:
+        pass
     proxy = _risk_mod('proxy')
     return proxy.uninstall(emit=emit)
 
@@ -1138,7 +1145,12 @@ SETTINGS_PATH = Path(DATA) / "toolbox_settings.json"
 
 
 def load_app_settings():
-    default = {"accel_enabled": False, "risk_enabled": None}
+    default = {
+        "accel_enabled": False,
+        "accel_autostart": False,
+        "risk_enabled": None,
+        "auto_check_update": True,
+    }
     if not SETTINGS_PATH.is_file():
         return default
     try:
@@ -1147,7 +1159,30 @@ def load_app_settings():
             default.update(d)
     except Exception:
         pass
+    # 开机自启默认关闭且永远不启用
+    default["accel_autostart"] = False
     return default
+
+
+def app_version():
+    import updater as U
+    return U.APP_VERSION
+
+
+def check_update():
+    import updater as U
+    return U.check_update()
+
+
+def download_update(download_url, asset_name, expected_size=0, progress_cb=None):
+    import updater as U
+    return U.download_update(download_url, asset_name, expected_size=expected_size,
+                             progress_cb=progress_cb)
+
+
+def launch_update_script(bat_path):
+    import updater as U
+    return U.launch_update_script(bat_path)
 
 
 def save_app_setting(key, value):
@@ -1280,14 +1315,31 @@ def startup_housekeeping():
     except Exception:
         pass
 
+    # 3.5 代理残留自愈：异常崩溃未走 shutdown_all() 时，清理未锁定的 .bak-* 与孤立 .ver*.dat；
+    # 若注入开关未开启，顺便清理残留的我方 version.dll，避免“关着工具箱进不去游戏”。
+    proxy_cleaned = {"bak": 0, "alt": 0, "dll": 0}
+    try:
+        cfg = _risk_mod("config").load(reload=True)
+        inject_on = bool((cfg.get("inject") or {}).get("enabled"))
+        active_dirs = _risk_mod("guard").active_battle_dirs()
+        proxy_cleaned = _risk_mod("proxy").cleanup_stale(
+            remove_dll=(not inject_on),
+            skip_dirs=active_dirs,
+        )
+    except Exception:
+        pass
+    summary["proxy_cleaned"] = proxy_cleaned
+
     # 4. 写一行简洁记录到 housekeeping.log
     try:
         os.makedirs(tb_dir, exist_ok=True)
         line = (
-            "%s  dumps=%d(%.1fMB) mc_killed=%d cache_removed=%d zombies=%s\n"
+            "%s  dumps=%d(%.1fMB) mc_killed=%d cache_removed=%d "
+            "proxy_bak=%d proxy_alt=%d proxy_dll=%d zombies=%s\n"
             % (time.strftime("%Y-%m-%d %H:%M:%S"),
                summary["dumps_removed"], summary["dumps_mb"],
                summary["mc_killed"], summary["cache_removed"],
+               proxy_cleaned["bak"], proxy_cleaned["alt"], proxy_cleaned["dll"],
                ",".join(summary["zombies"]) if summary["zombies"] else "none")
         )
         with open(os.path.join(tb_dir, "housekeeping.log"), "a", encoding="utf-8") as f:

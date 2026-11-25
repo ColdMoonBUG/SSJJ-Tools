@@ -263,6 +263,28 @@ def main():
         pid = int(argv[i + 1]) if i + 1 < len(argv) else 0
         sys.exit(_risk_inject_once(pid))
 
+    import diagnostics
+    diagnostics.start()
+    old_hook = sys.excepthook
+
+    def _log_exception(exc_type, exc, tb):
+        import traceback
+        diagnostics.record("未处理异常 " + "".join(
+            traceback.format_exception(exc_type, exc, tb)))
+        old_hook(exc_type, exc, tb)
+
+    sys.excepthook = _log_exception
+    old_thread_hook = threading.excepthook
+
+    def _log_thread_exception(args):
+        import traceback
+        diagnostics.record("线程异常 %s %s" % (
+            getattr(args.thread, "name", "?"),
+            "".join(traceback.format_exception(args.exc_type, args.exc_value,
+                                               args.exc_traceback))))
+        old_thread_hook(args)
+
+    threading.excepthook = _log_thread_exception
     from PySide6.QtWidgets import QApplication
 
     from ui.main_window import MainWindow
@@ -272,10 +294,15 @@ def main():
     app.setApplicationName("生死狙击工具箱")
     app.setOrganizationName("ssjj-tools")
     apply_theme(app)
+    if "--startup-smoke" in argv:
+        win = MainWindow()
+        diagnostics.record("启动自检通过：主窗口已创建")
+        diagnostics.finish()
+        return 0
     if not _ensure_single_instance():
+        diagnostics.finish()
         sys.exit(0)
     try:
-        import threading
         import backend as _bk
         threading.Thread(target=_bk.startup_housekeeping,
                          name="ssjj-housekeeping", daemon=True).start()
@@ -284,7 +311,9 @@ def main():
     _install_quit_guard(app)
     win = MainWindow()
     win.show()
-    sys.exit(app.exec())
+    result = app.exec()
+    diagnostics.finish()
+    sys.exit(result)
 
 
 if __name__ == "__main__":

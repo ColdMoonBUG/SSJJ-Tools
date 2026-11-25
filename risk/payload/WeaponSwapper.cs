@@ -53,6 +53,7 @@ namespace SsjjRisk
             "_thirdWeaponAnimationXmlAssetName",
             "_viewCameraConfigAssetName",
             "_particleXmlAssetName",
+            "_loigcXmlAssetName",
             "_soundXmlAssetName",
             "_effectXmlAssetName",
             "_eventParticleXmlAssetName",
@@ -62,6 +63,8 @@ namespace SsjjRisk
             "_effectPath",
             "_iconAssetName",
             "_viewAnimConfigAssetName",
+            "_weaponLayoutAssetName",
+            "_weaponLogicAssetName",
             "_icon_2AssetName",
             "_icon_AssetName",
         };
@@ -112,6 +115,7 @@ namespace SsjjRisk
             _started = true;
             try
             {
+                InspectProbe.Start();
                 Thread th = new Thread(Loop);
                 th.IsBackground = true;
                 th.Name = "SsjjWeaponSwapper";
@@ -221,42 +225,31 @@ namespace SsjjRisk
             }
         }
 
-        /// <summary>主线程热路径调用（零分配字典查找，极快）。</summary>
+        /// <summary>主线程热路径调用（零分配、零锁、零日志，极快）。</summary>
         public static string ResolveSkin(string weaponName, string origSkin)
         {
             if (!_globalEnabled || string.IsNullOrEmpty(weaponName))
                 return origSkin;
-            LogSeen(weaponName);
             Dictionary<string, string> map = _activeSkins;
             string target;
             if (map != null && map.TryGetValue(weaponName, out target) && !string.IsNullOrEmpty(target))
-            {
-                LogHit("皮肤", weaponName, target);
                 return target;
-            }
             return origSkin;
         }
 
-        /// <summary>供开镜准星与武器音效 Hook 调用：将原武器名映射为目标建模武器名。</summary>
+        /// <summary>供开镜准星与武器音效 Hook 调用：将原武器名映射为目标建模武器名（零锁零日志）。</summary>
         public static string ResolveModelWeapon(string weaponName)
         {
             if (!_globalEnabled || string.IsNullOrEmpty(weaponName))
                 return weaponName;
-            LogSeen(weaponName);
             Dictionary<string, string> map = _activeModels;
             string target;
             if (map != null && map.TryGetValue(weaponName, out target) && !string.IsNullOrEmpty(target))
-            {
-                LogHit("建模", weaponName, target);
                 return target;
-            }
             string baseName = FactionBase(weaponName);
             if (map != null && baseName != weaponName &&
                 map.TryGetValue(baseName, out target) && !string.IsNullOrEmpty(target))
-            {
-                LogHit("建模", weaponName, target);
                 return target;
-            }
             return weaponName;
         }
 
@@ -400,6 +393,7 @@ namespace SsjjRisk
             {
                 _hooksInstalled = true;
                 TryInstallCrossAndSoundHooks();
+                TryInstallVisualHooks();
             }
             else
                 _hookAttempts++;
@@ -440,6 +434,281 @@ namespace SsjjRisk
             {
                 Loader.Log("[skin] 武器音效 IL Hook 失败: " + ex.Message);
             }
+        }
+
+        private static void TryInstallVisualHooks()
+        {
+            try
+            {
+                Type binding = FindType("SSJJUIEditor.RunTime.EditorUiBinding");
+                MethodInfo refresh = binding == null ? null :
+                    binding.GetMethod("RefreshTexture", BindingFlags.Public | BindingFlags.Instance);
+                if (refresh != null)
+                {
+                    IntPtr ptr = BuildButterflyUiTintIL(refresh);
+                    if (ptr != IntPtr.Zero && InstallJumpHookPtr(refresh, ptr))
+                        Loader.Log("[skin] 已安装蝶舞准星 #66CCFF 着色 Hook");
+                }
+            }
+            catch (Exception ex)
+            {
+                Loader.Log("[skin] 蝶舞准星着色 Hook 失败: " + ex.GetType().Name + " " + ex.Message);
+            }
+
+            // 蝶舞 ui_logic.xml 的 IsHoldWeapon 直接读 WeaponDataProvider，
+            // 不会经过 DataProviderManager.GetWeaponName。
+            try
+            {
+                Type provider = FindType("WeaponDataProvider");
+                MethodInfo hold = provider == null ? null :
+                    provider.GetMethod("IsHoldWeapon", BindingFlags.Public | BindingFlags.Instance,
+                                       null, new[] { typeof(string) }, null);
+                if (hold != null)
+                {
+                    IntPtr ptr = BuildVisualHoldWeaponIL(hold);
+                    if (ptr != IntPtr.Zero && InstallJumpHookPtr(hold, ptr))
+                        Loader.Log("[skin] 已安装蝶舞专属 UI 持有武器判断 Hook");
+                    else
+                        Loader.Log("[skin] 蝶舞专属 UI 持有武器判断接口未匹配");
+                }
+            }
+            catch (Exception ex)
+            {
+                Loader.Log("[skin] 蝶舞专属 UI 判断 Hook 失败: " + ex.GetType().Name + " " + ex.Message);
+            }
+
+            try
+            {
+                Type viewSystem = FindType("Assets.Sources.Modules.Player.Anim.FirstPerson.ViewAnimSystem");
+                MethodInfo play = viewSystem == null ? null :
+                    viewSystem.GetMethod("PlayHandAnimation", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (play != null)
+                {
+                    IntPtr ptr = InspectPlayback.Build(play);
+                    if (ptr != IntPtr.Zero && InstallJumpHookPtr(play, ptr))
+                        Loader.Log("[skin] 已安装本地长检视播放 Hook");
+                    else
+                        Loader.Log("[skin] 长检视接口不匹配，本局保留原动画");
+                }
+            }
+            catch (Exception ex)
+            {
+                Loader.Log("[skin] 长检视 Hook 失败: " + ex.GetType().Name + " " + ex.Message);
+            }
+
+            // 专属 UI 的逻辑资源已随 WeaponInfo 替换；其数据提供器仍读取原武器名。
+            // 只在该 UI 读取武器名时映射到目标，供武器专属条件和扩展提供器使用。
+            try
+            {
+                Type provider = FindType("Assets.Libs.UiEditor.RunTime.RunTimeLogic.RunTimeNode.DataProviderManager");
+                MethodInfo get = provider == null ? null :
+                    provider.GetMethod("GetWeaponName", BindingFlags.Public | BindingFlags.Instance);
+                FieldInfo field = provider == null ? null :
+                    provider.GetField("CurrentWeaponName", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (get != null && field != null && field.FieldType == typeof(string) &&
+                    get.ReturnType == typeof(string) && get.GetParameters().Length == 0)
+                {
+                    DynamicMethod dm = new DynamicMethod("SsjjUiModelWeaponName",
+                        typeof(string), new[] { provider }, typeof(WeaponSwapper).Module, true);
+                    ILGenerator il = dm.GetILGenerator();
+                    il.Emit(OpCodes.Ldarg_0);
+                    il.Emit(OpCodes.Ldfld, field);
+                    il.Emit(OpCodes.Call, typeof(WeaponSwapper).GetMethod(nameof(ResolveModelWeapon)));
+                    il.Emit(OpCodes.Ret);
+                    Delegate del = dm.CreateDelegate(typeof(Func<,>).MakeGenericType(provider, typeof(string)));
+                    _pinnedDelegates.Add(del);
+                    RuntimeHelpers.PrepareMethod(del.Method.MethodHandle);
+                    if (InstallJumpHookPtr(get, del.Method.MethodHandle.GetFunctionPointer()))
+                        Loader.Log("[skin] 已安装武器专属 UI 名称映射 Hook");
+                }
+                else
+                    Loader.Log("[skin] 武器专属 UI 名称入口未匹配: provider=" +
+                               (provider != null) + " get=" + (get != null) +
+                               " field=" + (field != null));
+            }
+            catch (Exception ex)
+            {
+                Loader.Log("[skin] 武器专属 UI Hook 失败: " + ex.GetType().Name + " " + ex.Message);
+            }
+        }
+
+        public static bool IsVisualHoldWeapon(string actual, string requested)
+        {
+            if (string.IsNullOrEmpty(actual)) return false;
+            if (string.Equals(requested, "butterfly_knife", StringComparison.Ordinal) &&
+                string.Equals(ResolveModelWeapon(actual), requested, StringComparison.OrdinalIgnoreCase))
+                return true;
+            return actual.Equals(requested);
+        }
+
+        private static Type _uiImageType;
+        private static Type _uiColorType;
+        private static MethodInfo _uiGetComponent;
+        private static PropertyInfo _uiColor;
+        private static PropertyInfo _uiSprite;
+        private static readonly object[] BlueCrossSprites = new object[2];
+        // 26x41；保留原 crossProgress1/2 的透明轮廓，实色为 #66CCFF。
+        private static readonly string[] BlueCrossPng =
+        {
+            "iVBORw0KGgoAAAANSUhEUgAAABoAAAApCAYAAAArpDnNAAACEklEQVR42tWWP0gjURDGfy45SKnFcVqmtVOwOLwDCQFbIaQKFmkMcthdZ6vlccUVIggWR2xiYSGiEJcUioKinQc2whUXrGK53dnMwvDYP++9TQQHHvsSZvd738ybb2Zi7fY/hpXJtggPC9S+CwyBDlBlxDahGA1TfFaB3qgY1dR/oeETM+0WYRRITuJ1AdSBKVlN4FhYfAEGEtpCOUqyE6AhoA0JYVUAq6ME0tYTsKb87riwC9RHzFylWQjMCGAVOLcFioxVszxkKEBTwB0wKSs3dA15th3C+UflKrTNkUv4TMsFCxISjmfNxGB7ecoQ69yT7CseSjAnJVExlSRIEMyW7Pc9WN0D/aR3SwnOfXkueapNS0Ult2D7BcW6ZR40SOk3JcmXj1JHwKloY5THqGa0hsKWpXW7Bb/96CuqrnZtA1QHfhcE+qvnjyBDMEPpO189gSKby4C0gabkaneclyFmNiv7BwGs+ACVLP3aSjh/yn4HOBtHK48ZrgjI+jgYaTsClgUwzT4Bz0UYDRRIVtgWfUIXzwJDqYsti9ws+uboSan6do7vZ9/LsGTIf579AA5dgaZVt7Spn015Xrncul8S60gU4iXFr6xq7Dvwzed6XwIbFtNPR9XZgSvQhkygAzVvA3xQxbqshDM0/JwYzRsnJmHszQRwUYZ4qF8APiqgfy5DjIsE3YyzTbzJcPI+gV4BaYBwFqi2/kAAAAAASUVORK5CYII=",
+            "iVBORw0KGgoAAAANSUhEUgAAABoAAAApCAYAAAArpDnNAAACE0lEQVR42t2XvUsjQRiHn4QgKXOFWGtpKVpoCo8g2NyB+NGojSfYiOUVNif3B1ipHApHbCJCLKwEIUgs/CjCwbUWptPCwisDInfNO/DeuLOZ3dk0/iDMMLvZZ9+Z92tza62/BKrY5XoHIE/2qgA14FFGAAoZPXwKqGsLFLQfeAqxaBjYBZ4VxOhCzcdCLKqLFcgWXQKHMhqdAtNAKQ1oGjiWeQPYl7GrkoDMG3aABV9AUpCBzADnCawHaLpAdlxcy/ghQVxVlPc9+MSRgUwkPMtVGZfMQr4HEBM//7m5C7QdAKlFxJLTGWaBwYhI99GE/GdOL0ZZVDWeErBlSz7u/VFZk8m2RVm0CKwEJtiLqMV8RKJsyh53UpxPEejzAaU5fK2GSraxoLvAbdt3XbBBt/RIGlQC2oHPOwDWu4H+AC8pAZPAvRS+o9B65FJVQCtWhc0MtAOUgd/AUJYVFmAU2JT5T+CrbzgUEkK+A3uu6Pf1OqMBx70tYEvyWS0LUDnm/pZk5oq0WT0DAZxJF2R6uqL18wYBjHvkNNNutdNadKJKeZwWrBqWGHRj9Q0+sGoaEMA34Iv02HFn0ACWpdH/JUFcSgJqqNry7KoxoitgBNhQOfONcl2++OrAJ+sFXoEfam1eeeqIK1PkPD4ti9Zniq22WHMVV6F9UlAH+KzcXndITdNbZ51Ub5RXBqegnpfy9wH6BxbrbV3oPNX4AAAAAElFTkSuQmCC"
+        };
+
+        private static object BlueCrossSprite(int index)
+        {
+            if (BlueCrossSprites[index] != null) return BlueCrossSprites[index];
+            Type tex = FindType("UnityEngine.Texture2D");
+            Type convert = FindType("UnityEngine.ImageConversion");
+            Type sprite = FindType("UnityEngine.Sprite");
+            Type rect = FindType("UnityEngine.Rect");
+            Type vector = FindType("UnityEngine.Vector2");
+            if (tex == null || convert == null || sprite == null ||
+                rect == null || vector == null) return null;
+            MethodInfo load = convert.GetMethod("LoadImage", new[]
+                { tex, typeof(byte[]), typeof(bool) });
+            MethodInfo create = sprite.GetMethod("Create", new[]
+                { tex, rect, vector, typeof(float) });
+            if (load == null || create == null) return null;
+            object texture = Activator.CreateInstance(tex, new object[] { 26, 41 });
+            if (!(bool)load.Invoke(null, new object[]
+                { texture, Convert.FromBase64String(BlueCrossPng[index]), false })) return null;
+            object area = Activator.CreateInstance(rect, new object[] { 0f, 0f, 26f, 41f });
+            object pivot = Activator.CreateInstance(vector, new object[] { 0.5f, 0.5f });
+            return BlueCrossSprites[index] = create.Invoke(null,
+                new object[] { texture, area, pivot, 100f });
+        }
+
+        // 资源中的 crossProgress1/2 与已填充 icon1/2 透明轮廓相同；
+        // 仅将蝶舞的灰色默认图着色，不改武器能量或其它 UI。
+        public static void TintButterflyCross(object gameObject, string imagePath)
+        {
+            if (gameObject == null || imagePath == null ||
+                !imagePath.StartsWith("/weapon/butterfly_knife/ui/crossProgress",
+                                      StringComparison.OrdinalIgnoreCase)) return;
+            try
+            {
+                string name = gameObject.GetType().GetProperty("name", All)
+                    .GetValue(gameObject, null) as string;
+                if (name != "ImageLeft" && name != "ImageRight") return;
+                if (_uiImageType == null) _uiImageType = FindType("UnityEngine.UI.Image");
+                if (_uiColorType == null) _uiColorType = FindType("UnityEngine.Color");
+                if (_uiImageType == null || _uiColorType == null) return;
+                if (_uiGetComponent == null)
+                    _uiGetComponent = gameObject.GetType().GetMethod(
+                        "GetComponent", new[] { typeof(Type) });
+                if (_uiColor == null) _uiColor = _uiImageType.GetProperty("color", All);
+                if (_uiSprite == null) _uiSprite = _uiImageType.GetProperty("sprite", All);
+                if (_uiGetComponent == null || _uiColor == null) return;
+                object image = _uiGetComponent.Invoke(gameObject, new object[] { _uiImageType });
+                if (image != null)
+                {
+                    int index = name == "ImageRight" ? 1 : 0;
+                    object blue = BlueCrossSprite(index);
+                    if (blue != null && _uiSprite != null)
+                    {
+                        if (!ReferenceEquals(_uiSprite.GetValue(image, null), blue))
+                        {
+                            _uiSprite.SetValue(image, blue, null);
+                            _uiColor.SetValue(image, Activator.CreateInstance(_uiColorType,
+                                new object[] { 1f, 1f, 1f, 1f }), null);
+                        }
+                    }
+                    else
+                        _uiColor.SetValue(image, Activator.CreateInstance(_uiColorType,
+                            new object[] { 102f / 255f, 204f / 255f, 1f, 1f }), null);
+                }
+            }
+            catch { }
+        }
+
+        private static IntPtr BuildButterflyUiTintIL(MethodInfo original)
+        {
+            Delegate del = CreateButterflyUiTint(original);
+            if (del == null) return IntPtr.Zero;
+            _pinnedDelegates.Add(del);
+            RuntimeHelpers.PrepareMethod(del.Method.MethodHandle);
+            return del.Method.MethodHandle.GetFunctionPointer();
+        }
+
+        private static Delegate CreateButterflyUiTint(MethodInfo original)
+        {
+            ParameterInfo[] ps = original.GetParameters();
+            if (original.IsStatic || original.ReturnType != typeof(void) || ps.Length != 3)
+                return null;
+            Type go = ps[0].ParameterType;
+            Type data = ps[1].ParameterType;
+            Type manager = ps[2].ParameterType;
+            FieldInfo path = data.GetField("StringValue", All);
+            MethodInfo refresh = manager.GetMethod("RefreshImage", new[]
+                { go, typeof(string), typeof(bool) });
+            if (path == null || path.FieldType != typeof(string) ||
+                refresh == null || refresh.ReturnType != typeof(void)) return null;
+            DynamicMethod dm = new DynamicMethod("SsjjButterflyUiTint",
+                typeof(void), new[] { original.DeclaringType, go, data, manager },
+                typeof(WeaponSwapper).Module, true);
+            ILGenerator il = dm.GetILGenerator();
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldarga_S, (byte)2);
+            il.Emit(OpCodes.Ldfld, path);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Callvirt, refresh);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldarga_S, (byte)2);
+            il.Emit(OpCodes.Ldfld, path);
+            il.Emit(OpCodes.Call, typeof(WeaponSwapper).GetMethod(nameof(TintButterflyCross)));
+            il.Emit(OpCodes.Ret);
+            return dm.CreateDelegate(typeof(Action<,,,>).MakeGenericType(
+                original.DeclaringType, go, data, manager));
+        }
+
+        private static IntPtr BuildVisualHoldWeaponIL(MethodInfo orig)
+        {
+            Delegate del = CreateVisualHoldWeapon(orig);
+            if (del == null) return IntPtr.Zero;
+            _pinnedDelegates.Add(del);
+            RuntimeHelpers.PrepareMethod(del.Method.MethodHandle);
+            return del.Method.MethodHandle.GetFunctionPointer();
+        }
+
+        private static Delegate CreateVisualHoldWeapon(MethodInfo orig)
+        {
+            if (orig.IsStatic || orig.ReturnType != typeof(bool)) return null;
+            Type provider = orig.DeclaringType;
+            FieldInfo current = provider.GetField("_currentWeapon", All);
+            if (current == null) return null;
+            Type entity = current.FieldType;
+            Type basic = MemberType(entity, "basicInfo");
+            Type data = MemberType(basic, "Data");
+            if (MemberType(entity, "hasBasicInfo") != typeof(bool) ||
+                MemberType(data, "WeaponName") != typeof(string))
+                return null;
+
+            DynamicMethod dm = new DynamicMethod("SsjjVisualHoldWeapon", typeof(bool),
+                new[] { provider, typeof(string) }, typeof(WeaponSwapper).Module, true);
+            ILGenerator il = dm.GetILGenerator();
+            LocalBuilder weapon = il.DeclareLocal(entity);
+            Label absent = il.DefineLabel();
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, current);
+            il.Emit(OpCodes.Stloc, weapon);
+            il.Emit(OpCodes.Ldloc, weapon);
+            il.Emit(OpCodes.Brfalse, absent);
+            il.Emit(OpCodes.Ldloc, weapon);
+            EmitGet(il, entity, "hasBasicInfo");
+            il.Emit(OpCodes.Brfalse, absent);
+            il.Emit(OpCodes.Ldloc, weapon);
+            EmitGet(il, entity, "basicInfo");
+            EmitGet(il, basic, "Data");
+            EmitGet(il, data, "WeaponName");
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Call, typeof(WeaponSwapper).GetMethod(nameof(IsVisualHoldWeapon)));
+            il.Emit(OpCodes.Ret);
+            il.MarkLabel(absent);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Ret);
+
+            return dm.CreateDelegate(typeof(Func<,,>).MakeGenericType(provider, typeof(string), typeof(bool)));
         }
 
         private static IntPtr BuildCrossWeaponIL(Type uiCond)
@@ -485,11 +754,6 @@ namespace SsjjRisk
             EmitGet(il, tBi, "Data");
             EmitGet(il, tData, "WeaponName");
             il.Emit(OpCodes.Call, mResolveModel);
-            il.Emit(OpCodes.Stloc, locRes);
-
-            il.Emit(OpCodes.Ldloc, locRes);
-            il.Emit(OpCodes.Call, typeof(WeaponSwapper).GetMethod("LogCrossRes", BindingFlags.Public | BindingFlags.Static));
-            il.Emit(OpCodes.Ldloc, locRes);
             il.Emit(OpCodes.Ret);
 
             il.MarkLabel(lblEmpty);
@@ -510,9 +774,8 @@ namespace SsjjRisk
             if (ctor2 == null) return IntPtr.Zero;
 
             MethodInfo mResolveModel = typeof(WeaponSwapper).GetMethod(nameof(ResolveModelWeapon), BindingFlags.Public | BindingFlags.Static);
-            MethodInfo mConcat2 = typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) });
-            MethodInfo mConcat4 = typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string), typeof(string), typeof(string) });
-            if (mConcat2 == null || mConcat4 == null) return IntPtr.Zero;
+            MethodInfo mBundle = typeof(WeaponSwapper).GetMethod(nameof(SoundBundle), BindingFlags.NonPublic | BindingFlags.Static);
+            MethodInfo mAsset = typeof(WeaponSwapper).GetMethod(nameof(SoundAsset), BindingFlags.NonPublic | BindingFlags.Static);
 
             DynamicMethod dm = new DynamicMethod(
                 "SsjjGetWeaponSound", tAssetInfo, new[] { typeof(string), typeof(string) }, typeof(WeaponSwapper).Module, true);
@@ -520,27 +783,18 @@ namespace SsjjRisk
 
             LocalBuilder locW = il.DeclareLocal(typeof(string));
 
-            // 观测：先记一条「音效资源请求: <武器><后缀>」，确认这个 Hook 到底有没有被调用
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldarg_1);
-            il.Emit(OpCodes.Call, typeof(WeaponSwapper).GetMethod("LogSoundReq", BindingFlags.Public | BindingFlags.Static));
-
             // w = ResolveModelWeapon(arg0)
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Call, mResolveModel);
             il.Emit(OpCodes.Stloc, locW);
 
-            // arg1 for AssetInfo ctor: "sound/weapon/" + w
-            il.Emit(OpCodes.Ldstr, "sound/weapon/");
-            il.Emit(OpCodes.Ldloc, locW);
-            il.Emit(OpCodes.Call, mConcat2);
-
-            // arg2 for AssetInfo ctor: "Assets/Res/Assets/sound/weapon/" + w + suffix + ".mp3"
-            il.Emit(OpCodes.Ldstr, "Assets/Res/Assets/sound/weapon/");
             il.Emit(OpCodes.Ldloc, locW);
             il.Emit(OpCodes.Ldarg_1);
-            il.Emit(OpCodes.Ldstr, ".mp3");
-            il.Emit(OpCodes.Call, mConcat4);
+            il.Emit(OpCodes.Call, mBundle);
+
+            il.Emit(OpCodes.Ldloc, locW);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Call, mAsset);
 
             il.Emit(OpCodes.Newobj, ctor2);
             il.Emit(OpCodes.Ret);
@@ -551,6 +805,28 @@ namespace SsjjRisk
             MethodInfo mi = del.Method;
             RuntimeHelpers.PrepareMethod(mi.MethodHandle);
             return mi.MethodHandle.GetFunctionPointer();
+        }
+
+        // 蝶舞动画事件使用 fire2 / fire3。通用武器音效查询仍传进 _fire /
+        // _sec_fire；它们在蝶舞音效包中不存在，且 fire2 单独打包。
+        private static string SoundBundle(string weapon, string suffix)
+        {
+            if (string.Equals(weapon, "butterfly_knife", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(suffix, "_fire", StringComparison.OrdinalIgnoreCase))
+                return "sound/weapon/butterfly_knife_fire2";
+            return "sound/weapon/" + weapon;
+        }
+
+        private static string SoundAsset(string weapon, string suffix)
+        {
+            if (string.Equals(weapon, "butterfly_knife", StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.Equals(suffix, "_fire", StringComparison.OrdinalIgnoreCase))
+                    suffix = "_fire2";
+                else if (string.Equals(suffix, "_sec_fire", StringComparison.OrdinalIgnoreCase))
+                    suffix = "_fire3";
+            }
+            return "Assets/Res/Assets/sound/weapon/" + weapon + suffix + ".mp3";
         }
 
         private static bool EmitGet(ILGenerator il, Type t, string name)
@@ -852,6 +1128,7 @@ namespace SsjjRisk
         public static int UninstallHooks()
         {
             int n = 0;
+            InspectPlayback.Reset();
             lock (_hookLock)
             {
                 foreach (KeyValuePair<IntPtr, byte[]> kv in _hookOrig)
@@ -1272,14 +1549,106 @@ namespace SsjjRisk
                 }
                 if (copied > 0)
                 {
+                    SyncShowGunAction(src, dst);
                     _appliedModels[src] = dst;
                     Loader.Log("[skin] 建模替换生效: " + src + " -> " + dst + " (字段=" + copied + ")");
                 }
             }
         }
 
+        // 记录为原武器补挂的 ShowGunFrameExcludeAttackAction，还原时移除
+        private static readonly Dictionary<string, KeyValuePair<object, object>> _addedShowGun =
+            new Dictionary<string, KeyValuePair<object, object>>(StringComparer.OrdinalIgnoreCase);
+
+        private static object GetPredicationConfig(string weaponName)
+        {
+            try
+            {
+                Type tFac = FindType("Assets.Sources.Info.Weapon.PredicationConfigFactory");
+                if (tFac == null) return null;
+                FieldInfo fInst = tFac.GetField("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                object inst = fInst != null ? fInst.GetValue(null) : null;
+                if (inst == null) return null;
+                MethodInfo mGet = tFac.GetMethod("GetPredicationConfig", new[] { typeof(string) });
+                if (mGet == null) return null;
+                return mGet.Invoke(inst, new object[] { weaponName });
+            }
+            catch { return null; }
+        }
+
+        private static object GetFrameActions(object predCfg)
+        {
+            if (predCfg == null) return null;
+            try
+            {
+                MethodInfo mSys = predCfg.GetType().GetMethod("GetAttackPredicationSystem", All);
+                object sys = mSys != null ? mSys.Invoke(predCfg, null) : null;
+                if (sys == null) return null;
+                FieldInfo fFrame = FindFieldInHierarchy(sys.GetType(), "FrameActions");
+                return fFrame != null ? fFrame.GetValue(sys) : null;
+            }
+            catch { return null; }
+        }
+
+        private static bool HasShowGunAction(object frameActions)
+        {
+            System.Collections.IEnumerable seq = frameActions as System.Collections.IEnumerable;
+            if (seq == null) return false;
+            foreach (object item in seq)
+            {
+                if (item != null && item.GetType().Name.IndexOf("ShowGun", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 当目标建模武器支持 V 键检视（如蝶舞 butterfly_knife）而原武器没有挂 ShowGun 动作时，
+        /// 仅在 FrameActions 末尾补挂 ShowGunFrameExcludeAttackAction（待机/移动按 V 播 44 号检视动画，
+        /// 不改 LeftActions/RightActions 及任何攻击判定）。
+        /// </summary>
+        private static void SyncShowGunAction(string src, string dst)
+        {
+            try
+            {
+                if (_addedShowGun.ContainsKey(src)) return;
+                object dstActions = GetFrameActions(GetPredicationConfig(dst));
+                if (dstActions == null || !HasShowGunAction(dstActions)) return;
+                object srcActions = GetFrameActions(GetPredicationConfig(src));
+                if (srcActions == null || HasShowGunAction(srcActions)) return;
+
+                Type tAction = FindType("weapon.predicateSystem.attackSystem.actions.ShowGunFrameExcludeAttackAction");
+                if (tAction == null) return;
+                object act = Activator.CreateInstance(tAction);
+                if (act == null) return;
+
+                MethodInfo mAdd = srcActions.GetType().GetMethod("Push") ?? srcActions.GetType().GetMethod("Add");
+                if (mAdd == null) return;
+                mAdd.Invoke(srcActions, new object[] { act });
+                _addedShowGun[src] = new KeyValuePair<object, object>(srcActions, act);
+            }
+            catch { }
+        }
+
+        private static void RestoreShowGunAction(string src)
+        {
+            try
+            {
+                KeyValuePair<object, object> pair;
+                if (!_addedShowGun.TryGetValue(src, out pair)) return;
+                _addedShowGun.Remove(src);
+                if (pair.Key != null && pair.Value != null)
+                {
+                    MethodInfo mRem = pair.Key.GetType().GetMethod("Remove");
+                    if (mRem != null) mRem.Invoke(pair.Key, new object[] { pair.Value });
+                }
+            }
+            catch { }
+        }
+
         private static void RestoreModel(object factory, string src)
         {
+            RestoreShowGunAction(src);
             Dictionary<string, object> bak;
             if (_backups.TryGetValue(src, out bak))
             {

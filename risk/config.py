@@ -60,6 +60,11 @@ DEFAULTS = {
 _cache = None
 
 
+def allow_thread_inject():
+    """仅当显式设置 SSJJ_ALLOW_THREAD_INJECT=1 时允许旧的远程线程注入模式。"""
+    return str(os.environ.get("SSJJ_ALLOW_THREAD_INJECT") or "").strip() == "1"
+
+
 def _deep_merge(base, over):
     out = dict(base)
     for k, v in (over or {}).items():
@@ -83,6 +88,15 @@ def load(reload=False):
         except Exception:
             data = {}
     _cache = _deep_merge(DEFAULTS, data)
+    inj = _cache.get("inject")
+    if isinstance(inj, dict):
+        method = str(inj.get("method") or "proxy").strip().lower()
+        if method != "proxy" and not allow_thread_inject():
+            inj["method"] = "proxy"
+            try:
+                save(_cache)
+            except Exception:
+                pass
     return _cache
 
 

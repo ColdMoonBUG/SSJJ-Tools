@@ -50,6 +50,11 @@ __declspec(dllimport) u32 __stdcall GetModuleFileNameW(HMODULE m, u16 *buf, u32 
 __declspec(dllimport) ibool __stdcall MoveFileW(const u16 *from, const u16 *to);
 __declspec(dllimport) ibool __stdcall MoveFileExW(const u16 *from, const u16 *to, u32 flags);
 __declspec(dllimport) u32 __stdcall GetLastError(void);
+__declspec(dllimport) u32 __stdcall GetEnvironmentVariableW(const u16 *name, u16 *buf, u32 size);
+__declspec(dllimport) HANDLE __stdcall CreateFileW(const u16 *path, u32 access, u32 share, void *sa, u32 disp, u32 attr, HANDLE tmpl);
+__declspec(dllimport) int __stdcall MultiByteToWideChar(u32 cp, u32 flags, const char *src, int srclen, u16 *dst, int dstlen);
+__declspec(dllimport) ibool __stdcall DeleteFileW(const u16 *path);
+__declspec(dllimport) u32 __stdcall GetCurrentProcessId(void);
 
 #include "payload_dll.h"
 
@@ -117,6 +122,10 @@ static void plog_n(const char *a, u32 v)
     plog(buf);
 }
 
+/* DllMain 里找到就记下来：两条链摘掉之后 InLoadOrder 遍历不到自己了，
+   第 3 条链只能靠这个指针直接摘。 */
+static void *g_entry;
+
 /* 在三条链表里找 DllBase == self 的条目；mask=1 只摘前两条，mask=7 三条全摘。
    返回摘掉的链表条数。 */
 static int cloak_module(HMODULE self, int full)
@@ -134,6 +143,7 @@ static int cloak_module(HMODULE self, int full)
         LDR_ENTRY *e = (LDR_ENTRY *)cur;
         if (e->DllBase == (void *)self) {
             int n = 0;
+            g_entry = (void *)e;
             unlink_entry(&e->InLoadOrderLinks);
             n++;
             unlink_entry(&e->InMemoryOrderLinks);
@@ -208,31 +218,48 @@ static void cat(char *dst, int cap, const char *a, const char *b)
     dst[i] = 0;
 }
 
-static char g_log[512];
+static void u16cat(u16 *dst, int cap, const u16 *a, const u16 *b)
+{
+    int i = 0, j = 0;
+    while (a && a[i] && i < cap - 1) { dst[i] = a[i]; i++; }
+    while (b && b[j] && i < cap - 1) { dst[i] = b[j]; i++; j++; }
+    dst[i] = 0;
+}
+
+/* 日志路径用宽字符：用户目录带中文（如 C:\\Users\\张三\\AppData\\...）时，
+   原来的 CreateFileA 会按 ANSI 代码页去解释 UTF-8 字节，建文件失败 → 整局 proxy.log 0 行，
+   现场就只剩「游戏自己退出」一个现象，没法定位。 */
+static u16 g_logw[520];
 static ibool g_log_ready = 0;
 
 static void open_log(void)
 {
-    char base[400];
-    u32 n = GetEnvironmentVariableA("LOCALAPPDATA", base, (u32)sizeof(base));
-    if (n == 0 || n >= sizeof(base)) return;
-    char dir[460];
-    cat(dir, (int)sizeof(dir), base, "\\ssjj-toolbox");
-    /* 目录一般已存在（工具箱建过）；不存在时 CreateFileA 会失败，静默跳过 */
-    cat(g_log, (int)sizeof(g_log), dir, "\\proxy.log");
+    if (g_log_ready) return;
+    u16 base[400];
+    u32 n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, 400);
+    if (n == 0 || n >= 400) {
+        /* 极端情况（服务账户没有 LOCALAPPDATA）：退到 C:\\Windows\\Temp */
+        u16cat(g_logw, 520, L"C:\\Windows\\Temp", L"\\ssjj_proxy.log");
+        g_log_ready = 1;
+        return;
+    }
+    u16cat(g_logw, 520, base, L"\\ssjj-toolbox\\proxy.log");
     g_log_ready = 1;
 }
 
 static void plog(const char *msg)
 {
+    if (!g_log_ready) open_log();
     if (!g_log_ready) return;
-    HANDLE h = CreateFileA(g_log, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
+    /* 内容仍是 UTF-8 字节（工具箱的诊断包按 UTF-8 直接读），只有「路径」用宽字符：
+       中文用户名（C:\\Users\\张三\\AppData\\...）下 CreateFileA 会按 ANSI 解释
+       UTF-8 字节，建文件直接失败 → 整局 proxy.log 0 行，现场什么都看不到。 */
+    HANDLE h = CreateFileW(g_logw, 0x00000004u /*FILE_APPEND_DATA*/, FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (h == (HANDLE)-1 || !h) return;
-    SetFilePointer(h, 0, 0, FILE_END);
-    u32 w = 0;
-    WriteFile(h, msg, slen(msg), &w, 0);
-    WriteFile(h, "\r\n", 2, &w, 0);
+    u32 wr = 0;
+    WriteFile(h, msg, slen(msg), &wr, 0);
+    WriteFile(h, "\r\n", 2, &wr, 0);
     CloseHandle(h);
 }
 
@@ -399,6 +426,27 @@ static int hide_self(HMODULE self)
     for (k = 0; k < (int)n; k++) if (path[k] == '\\') cut = k;
     if (cut < 0) return -2;
 
+    /* 先清理历史槽位：残留的 .ver.dat / .ver1~9.dat 会把 10 个名字占满，
+       导致这次改名直接 -1999（其它机器上就是「过检测失效、之后一直进不去」的成因之一）。
+       删不掉的（还被上一局进程映射着）跳过即可，DeleteFileW 失败不影响后面。 */
+    {
+        int ci;
+        for (ci = 0; ci < 10; ci++) {
+            u16 tmp[520];
+            int kk;
+            for (kk = 0; kk <= cut; kk++) tmp[kk] = path[kk];
+            const char *p2 = ".ver";
+            int t2 = 0;
+            while (p2[t2]) { tmp[cut + 1 + t2] = (u16)(unsigned char)p2[t2]; t2++; }
+            if (ci > 0) tmp[cut + 1 + t2++] = (u16)('0' + ci);
+            const char *s2 = ".dat";
+            int u2 = 0;
+            while (s2[u2]) { tmp[cut + 1 + t2] = (u16)(unsigned char)s2[u2]; u2++; t2++; }
+            tmp[cut + 1 + t2] = 0;
+            DeleteFileW(tmp);
+        }
+    }
+
     /* 依次尝试 .ver.dat / .ver1.dat ... .ver9.dat：上一局留下的 .ver.dat 可能被别的进程
        锁着（实测 MoveFileEx REPLACE_EXISTING 也报 1005 Access denied），换个名字绕开。 */
     int idx;
@@ -485,13 +533,23 @@ typedef u64(__stdcall *fn_settimer)(void *, u64, u32, void *);
 typedef ibool(__stdcall *fn_killtimer)(void *, u64);
 
 static int g_step;
-static int g_done;
-static int g_renamed;
+static volatile long g_done;
+static volatile long g_renamed;
 static fn_killtimer g_killtimer;
+static u64 g_timer_id;          /* SetTimer(hWnd=0) 的真实返回值，KillTimer 必须用它 */
 
 static void stop_timer(void)
 {
-    if (g_killtimer) g_killtimer(0, 1);
+    if (g_killtimer && g_timer_id) { g_killtimer(0, g_timer_id); g_timer_id = 0; }
+}
+
+/* 第 3 条链（InInitializationOrder）只能靠 DllMain 记下的条目指针去摘 */
+static void unlink_init_chain(void)
+{
+    if (!g_entry) { plog("[proxy] 没记录 LDR 条目，跳过第 3 条链"); return; }
+    LDR_ENTRY *e = (LDR_ENTRY *)g_entry;
+    unlink_entry(&e->InInitializationOrderLinks);
+    plog("[proxy] 已摘 InInitializationOrder 链（三条链全部摘除）");
 }
 
 static void __stdcall on_timer(void *wnd, u32 msg, u64 id, u32 tick)
@@ -519,9 +577,7 @@ static void __stdcall on_timer(void *wnd, u32 msg, u64 id, u32 tick)
         plog_n("[proxy] DllMain 路径伪装=", (u32)(g_spoof < 0 ? 90 : g_spoof));
         plog_n("[proxy] DllMain 摘链条数=", (u32)g_cloak_boot);
         plog_n("[proxy] 系统 version.dll 句柄=", (u32)(g_sys_pinned != 0));
-        int n = cloak_module(g_self, 1);      /* 补摘 InInitializationOrder 链 */
-        if (n > 0) plog("[proxy] 已从 PEB 模块链表中摘除自身（枚举看不到 VERSION.dll）");
-        else plog("[proxy] PEB 摘链未命中（模块枚举仍能看到 VERSION.dll）");
+        unlink_init_chain();
     }
 
     /* 3) 等 mono 起来，把载荷灌进去 */
@@ -531,28 +587,114 @@ static void __stdcall on_timer(void *wnd, u32 msg, u64 id, u32 tick)
         return;
     }
     if (g_step < 1) return;
+    if (_InterlockedCompareExchange(&g_done, 1, 0) != 0) { stop_timer(); return; }
     open_log();
     plog("[proxy] mono 模块已就位");
-    g_done = 1;
     stop_timer();
     run_payload(mono);
 }
 
 /* SetTimer 拿不到时的兜底（会创建线程，只在上面的路走不通时用） */
+/* 兜底线程：始终创建。实测有机器在 -window-mode exclusive 下主线程跑了近 3 秒
+   也没派发过一次 WM_TIMER，只靠定时器会「改名没做、载荷没加载、proxy.log 0 行」。
+   这里只做三件事：抢改名、补摘第 3 条链、等 mono 后灌载荷（与定时器路径用 g_done 原子互斥）。 */
 static u32 __stdcall worker(void *arg)
 {
     (void)arg;
     open_log();
-    plog("[proxy] 兜底线程启动（SetTimer 不可用）");
-    hide_self(g_self);
+    plog("[proxy] 后台线程启动（定时器之外的兜底路径）");
     int i;
+    for (i = 0; i < 200 && !g_renamed; i++) {
+        int hr = hide_self(g_self);
+        if (hr == 1) { g_renamed = 1; plog("[proxy] 已把自身文件改名为 .ver.dat（线程路径）"); break; }
+        if (hr == 0) { g_renamed = 1; plog("[proxy] 自身文件已是 .ver.dat（别的进程改的）"); break; }
+        Sleep(25);
+    }
+    if (!g_renamed) plog("[proxy] 线程路径改名未成功（目录里可能仍是 version.dll）");
+    unlink_init_chain();
     for (i = 0; i < 2400; i++) {
         HMODULE mono = GetModuleHandleA("mono-2.0-bdwgc.dll");
-        if (mono) { plog("[proxy] mono 模块已就位"); run_payload(mono); return 0; }
+        if (mono) {
+            if (_InterlockedCompareExchange(&g_done, 1, 0) == 0) {
+                plog("[proxy] mono 模块已就位（线程路径）");
+                run_payload(mono);
+            }
+            return 0;
+        }
         Sleep(25);
     }
     plog("[proxy] 等不到 mono-2.0-bdwgc.dll，放弃");
     return 0;
+}
+
+static u16 to_lower_ascii(u16 c)
+{
+    return (c >= 'A' && c <= 'Z') ? (u16)(c + ('a' - 'A')) : c;
+}
+
+/* 仅允许在战斗端主进程 SSJJ_BattleClient_Unity.exe 中激活代理逻辑。
+   同目录的 UnityCrashHandler64.exe 等辅助进程也会加载本地 version.dll；
+   若不过滤宿主进程，它们会抢先执行 hide_self() 把 version.dll 改名为 .ver.dat，
+   导致真正的战斗端随后找不到本地 DLL 而回退系统 System32\version.dll，换肤彻底失效。 */
+static int is_battle_client_host(void)
+{
+    u16 exe[520];
+    u32 n = GetModuleFileNameW(0, exe, 520);
+    if (n == 0 || n >= 520) return 0;
+    int start = 0, i;
+    for (i = 0; i < (int)n; i++) {
+        if (exe[i] == '\\' || exe[i] == '/') start = i + 1;
+    }
+    const char *want = "ssjj_battleclient_unity.exe";
+    int j = 0;
+    while (want[j] && exe[start + j]) {
+        if (to_lower_ascii(exe[start + j]) != (u16)(unsigned char)want[j]) return 0;
+        j++;
+    }
+    return want[j] == 0 && exe[start + j] == 0;
+}
+
+static int get_host_basename_utf8(char *out, int cap)
+{
+    u16 exe[520];
+    u32 n = GetModuleFileNameW(0, exe, 520);
+    if (n == 0 || n >= 520) {
+        if (cap > 0) out[0] = 0;
+        return 0;
+    }
+    int start = 0, i;
+    for (i = 0; i < (int)n; i++) {
+        if (exe[i] == '\\' || exe[i] == '/') start = i + 1;
+    }
+    int j = 0;
+    while (exe[start + j] && j < cap - 1) {
+        u16 c = exe[start + j];
+        out[j] = (c < 128) ? (char)c : '?';
+        j++;
+    }
+    out[j] = 0;
+    return j;
+}
+
+static void log_attach(u32 pid, int match, const char *host)
+{
+    char buf[256];
+    int n = 0, k = 0;
+    const char *p1 = "[proxy] ATTACH pid=";
+    while (p1[k] && n < 240) buf[n++] = p1[k++];
+    char tmp[16];
+    int tk = 0;
+    if (pid == 0) tmp[tk++] = '0';
+    while (pid > 0) { tmp[tk++] = (char)('0' + (pid % 10)); pid /= 10; }
+    while (tk > 0 && n < 240) buf[n++] = tmp[--tk];
+    const char *p2 = match ? " match=1 host=" : " match=0 host=";
+    k = 0;
+    while (p2[k] && n < 240) buf[n++] = p2[k++];
+    k = 0;
+    while (host && host[k] && n < 254) buf[n++] = host[k++];
+    buf[n] = 0;
+    open_log();
+    plog(buf);
 }
 
 ibool __stdcall DllMain(HANDLE mod, u32 reason, void *reserved)
@@ -560,6 +702,18 @@ ibool __stdcall DllMain(HANDLE mod, u32 reason, void *reserved)
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = (HMODULE)mod;
+        int is_battle = is_battle_client_host();
+        {
+            char host[128];
+            get_host_basename_utf8(host, (int)sizeof(host));
+            log_attach(GetCurrentProcessId(), is_battle, host[0] ? host : "?");
+        }
+        if (!is_battle) {
+            /* 非战斗端进程（如 UnityCrashHandler64.exe）：仅加载系统 version.dll 做纯 API 转发透传，
+               严禁改名、严禁摘链、严禁挂定时器、严禁起后台线程。 */
+            g_sys_pinned = LoadLibraryA("C:\\Windows\\System32\\version.dll");
+            return 1;
+        }
         /* 改名必须赶在游戏自己的自检扫描之前：它在启动 ~90ms 就枚举 exe 旁文件并上报
            「Suspicious proxy DLL exists beside game exe」。定时器第一次回调要 200ms，
            太晚；DllMain 里只做一次 MoveFile，代价是一次文件元数据操作，可以接受。 */
@@ -583,15 +737,25 @@ ibool __stdcall DllMain(HANDLE mod, u32 reason, void *reserved)
             g_spoof = spoof_names((HMODULE)mod);
             g_cloak_boot = cloak_module((HMODULE)mod, 0);
         }
+        /* DllMain 里就把第一行写进日志：以前的版本一旦定时器没派发，proxy.log 就是 0 行，
+           现场只能看到「游戏自己退出」，根本没法判断是改名失败还是根本没进来。 */
+        open_log();
+        plog_n("[proxy] DllMain 进入 pid=", GetCurrentProcessId());
+        plog_n("[proxy] 路径伪装=", (u32)(g_spoof < 0 ? 90 : g_spoof));
+
         HMODULE u = GetModuleHandleA("user32.dll");
         fn_settimer pset = u ? (fn_settimer)GetProcAddress(u, "SetTimer") : 0;
         g_killtimer = u ? (fn_killtimer)GetProcAddress(u, "KillTimer") : 0;
         if (pset) {
-            if (!pset(0, 1, 25, (void *)on_timer)) {
-                u32 tid = 0;
-                CreateThread(0, 0, worker, mod, 0, &tid);
-            }
+            u64 id = (u64)pset(0, 1, 25, (void *)on_timer);
+            g_timer_id = id;
+            if (!id) plog("[proxy] SetTimer 失败，只靠后台线程");
         } else {
+            plog("[proxy] 取不到 SetTimer，只靠后台线程");
+        }
+        /* 定时器与线程两条路都开：定时器没派发时线程顶上，线程被拦时定时器顶上，
+           两边用 g_done / g_renamed 互斥，不会重复加载载荷。 */
+        {
             u32 tid = 0;
             CreateThread(0, 0, worker, mod, 0, &tid);
         }

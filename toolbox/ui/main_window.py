@@ -26,7 +26,7 @@ NAV = [("一键启动", "one", "\uE768"),
        ("换肤注入", "risk", "\uE7BA"),
        ("大厅帧率", "fps", "\uE7FC"),
        ("本地加速", "accel", "\uE896"),
-       ("工具", "tools", "\uE713")]
+       ("设置", "tools", "\uE713")]
 
 
 def _draw_logo_pixmap(size=64):
@@ -115,7 +115,7 @@ class TitleBar(QWidget):
         title.setObjectName("AppTitle")
         lay.addWidget(title)
 
-        ver = QLabel("v1.1.0")
+        ver = QLabel("v" + backend.app_version())
         ver.setObjectName("VersionTag")
         ver.setFixedHeight(22)
         lay.addWidget(ver, 0, Qt.AlignVCenter)
@@ -244,10 +244,11 @@ class MainWindow(QWidget):
         sl.addWidget(card)
 
         sl.addSpacing(6)
-        foot = QLabel("本地资源优先 · 随时一键还原")
+        foot = QLabel("BUG反馈QQ群：193808764")
         foot.setObjectName("DimSmall")
         foot.setAlignment(Qt.AlignCenter)
         foot.setWordWrap(True)
+        foot.setTextInteractionFlags(Qt.TextSelectableByMouse)
         sl.addWidget(foot)
         body.addWidget(side)
 
@@ -287,6 +288,40 @@ class MainWindow(QWidget):
         self._poll()
         # 启动后自动恢复上次开启的加速服务、风险注入守护与武器皮肤配置
         QTimer.singleShot(300, self._auto_restore)
+        # 启动后延迟 1.5s 静默检测 GitHub 新版本（不阻塞启动）
+        QTimer.singleShot(1500, self._auto_check_update)
+
+    def _auto_check_update(self):
+        try:
+            st = backend.load_app_settings()
+            if not st.get("auto_check_update", True):
+                return
+        except Exception:
+            return
+
+        def job(_w):
+            return backend.check_update()
+
+        def done(info):
+            if not isinstance(info, dict) or not info.get("ok") or not info.get("has_update"):
+                return
+            tools_page = self.pages.get("tools")
+            if tools_page and hasattr(tools_page, "apply_update_info"):
+                tools_page.apply_update_info(info)
+            from PySide6.QtWidgets import QMessageBox
+            latest = info.get("latest") or info.get("tag") or "新版本"
+            ans = QMessageBox.question(
+                self,
+                "发现新版本 v%s" % latest,
+                "检测到新版本 v%s（当前 v%s）。\n是否前往「设置」页拉取更新？"
+                % (latest, backend.app_version()),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ans == QMessageBox.Yes:
+                self.goto("tools")
+
+        self.run(job, on_done=done)
 
     def _auto_restore(self):
         def job(_w):
@@ -393,6 +428,11 @@ class MainWindow(QWidget):
         if getattr(self, "_closing", False):
             ev.accept()
             return
+        try:
+            import diagnostics
+            diagnostics.record("窗口关闭，开始后台收尾")
+        except Exception:
+            pass
         self._closing = True
         self._shutdown_done = False
         self._shutdown_t0 = time.time()
@@ -411,9 +451,18 @@ class MainWindow(QWidget):
         def work():
             try:
                 backend.shutdown_all()
+            except Exception as exc:
+                try:
+                    import diagnostics
+                    diagnostics.record("后台收尾异常 %r" % exc)
+                except Exception:
+                    pass
+            self._shutdown_done = True
+            try:
+                import diagnostics
+                diagnostics.record("后台收尾完成")
             except Exception:
                 pass
-            self._shutdown_done = True
             try:
                 _a = QApplication.instance()
                 if _a is not None:
@@ -428,6 +477,12 @@ class MainWindow(QWidget):
 
     def _poll_shutdown(self):
         if self._shutdown_done or (time.time() - self._shutdown_t0) > 12.0:
+            if not self._shutdown_done:
+                try:
+                    import diagnostics
+                    diagnostics.record("后台收尾超时，准备退出")
+                except Exception:
+                    pass
             try:
                 self._close_timer.stop()
             except Exception:

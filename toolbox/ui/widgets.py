@@ -197,10 +197,28 @@ class Worker(QObject):
 
     def _run(self):
         try:
+            import diagnostics
+            diagnostics.record("后台任务开始 page=%s task=%s" % (
+                type(self.parent()).__name__, getattr(self.fn, "__name__", "?")))
+        except Exception:
+            pass
+        try:
             result = self.fn(self)
         except Exception as exc:  # noqa: BLE001
+            try:
+                import diagnostics
+                import traceback
+                diagnostics.record("后台任务异常 " + traceback.format_exc())
+            except Exception:
+                pass
             self.log.emit("[错误] %r" % (exc,))
             result = None
+        try:
+            import diagnostics
+            diagnostics.record("后台任务结束 page=%s task=%s" % (
+                type(self.parent()).__name__, getattr(self.fn, "__name__", "?")))
+        except Exception:
+            pass
         self.done.emit(result)
 
 

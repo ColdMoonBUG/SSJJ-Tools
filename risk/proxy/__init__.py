@@ -35,9 +35,12 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
+from pathlib import Path
 
 NAME = "version.dll"
+_STATE_LOCK = threading.RLock()
 
 try:
     from . import paths as _paths
@@ -147,78 +150,344 @@ def _save_state(d):
 RENAMED = ".ver.dat"
 
 
+def _norm_dir(p):
+    return os.path.normcase(os.path.abspath(os.fspath(p)))
+
+
+def _alt_candidates(d):
+    """目录里代理可能藏成的全部候选路径：.ver.dat / .ver1.dat … .ver9.dat"""
+    d = os.fspath(d)
+    return [os.path.join(d, RENAMED)] + [os.path.join(d, ".ver%d.dat" % i) for i in range(1, 10)]
+
+
 def _alts(d):
     """目录里代理可能藏成的名字：.ver.dat / .ver1.dat … .ver9.dat"""
-    out = []
-    alt = os.path.join(d, RENAMED)
-    if os.path.isfile(alt):
-        out.append(alt)
-    for i in range(1, 10):
-        p = os.path.join(d, ".ver%d.dat" % i)
-        if os.path.isfile(p):
-            out.append(p)
-    return out
+    return [p for p in _alt_candidates(d) if os.path.isfile(p)]
 
 
-def heal(emit=None):
-    """把被代理自己改名藏起来的 version.dll 补回来。
+def _baks(d):
+    """目录里历史备份 version.dll.bak-*。"""
+    return [p for p in sorted(glob.glob(os.path.join(os.fspath(d), NAME + ".bak-*"))) if os.path.isfile(p)]
+
+
+def _system_version_md5():
+    """系统真身 version.dll 的 md5（缓存）。用来区分「别人的 DLL」与「Windows 自己的」。"""
+    global _SYS_MD5
+    if _SYS_MD5 is not None:
+        return _SYS_MD5
+    try:
+        _SYS_MD5 = _md5(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", NAME))
+    except Exception:
+        _SYS_MD5 = ""
+    return _SYS_MD5
+
+
+_SYS_MD5 = None
+
+
+def _known_hashes(state=None):
+    """收集确认属于本工具的代理 DLL MD5 集合（当前内置 + proxy_state.json 历史记录）。"""
+    st = _load_state() if state is None else (state or {})
+    hashes = {h for h in (our_md5(), st.get("md5")) if h}
+    for info in (st.get("installed") or {}).values():
+        if isinstance(info, dict) and info.get("md5"):
+            hashes.add(info["md5"])
+    return hashes
+
+
+def _try_remove(path):
+    try:
+        os.remove(path)
+        return True, None
+    except FileNotFoundError:
+        return True, None
+    except OSError as exc:
+        return False, exc
+
+
+def _clean_extras(d, remove_alts=True, remove_baks=True):
+    """清理未锁定的多余 .ver*.dat 与 version.dll.bak-*，返回 (alts_removed, baks_removed)。"""
+    alt_n = bak_n = 0
+    if remove_alts:
+        for a in _alts(d):
+            if os.path.isfile(a):
+                ok, _ = _try_remove(a)
+                if ok:
+                    alt_n += 1
+    if remove_baks:
+        for b in _baks(d):
+            if os.path.isfile(b):
+                ok, _ = _try_remove(b)
+                if ok:
+                    bak_n += 1
+    return alt_n, bak_n
+
+
+def record_existing_deployed(dirs=None):
+    """确保目录中沿用的我方 version.dll 全部补记入 proxy_state.json。"""
+    targets = list(dirs) if dirs is not None else battle_dirs()
+    with _STATE_LOCK:
+        state = _load_state()
+        hashes = _known_hashes(state)
+        want = our_md5()
+        installed = state.setdefault("installed", {})
+        now = time.time()
+        recorded = []
+        dirty = False
+        for d in targets:
+            cur = os.path.join(d, NAME)
+            if not os.path.isfile(cur):
+                continue
+            try:
+                cur_md5 = _md5(cur)
+            except OSError:
+                continue
+            if cur_md5 not in hashes and not (want and cur_md5 == want):
+                continue
+            prev = installed.get(d)
+            if not isinstance(prev, dict) or prev.get("md5") != cur_md5:
+                installed[d] = {"ts": now, "md5": cur_md5, "existing": True}
+                dirty = True
+            recorded.append(d)
+        if want and not state.get("md5") and recorded:
+            state["md5"] = want
+            dirty = True
+        if dirty:
+            state["ts"] = now
+            _save_state(state)
+        return recorded
+
+
+def hide_in_dir(battle_dir: Path) -> tuple[bool, str]:
+    """从外部协同将 battle_dir 中的我方 version.dll 改名为 .ver.dat（冲突试 .ver1.dat~.ver9.dat）。"""
+    d = os.fspath(battle_dir)
+    cur = os.path.join(d, NAME)
+    if not os.path.isfile(cur):
+        # 幂等：目录里本来就没有 version.dll，目标状态已达成
+        return True, "目录中无 version.dll（无需处理）"
+    try:
+        cur_md5 = _md5(cur)
+    except OSError as exc:
+        return False, "读取 version.dll 失败: %s" % exc
+    with _STATE_LOCK:
+        if cur_md5 not in _known_hashes():
+            # 不是我们部署的版本也照样挪走：战斗端运行期间，exe 旁边任何 version.dll
+            # 都会让 RuntimeCheatGuard 报「Suspicious proxy DLL exists beside game exe」
+            # 并踢出对局（别的工具箱/旧版本残留都会踩这条）。只有 Windows 自己的那份不动。
+            if cur_md5 and cur_md5 == _system_version_md5():
+                return False, "这是系统自带的 version.dll，不动它"
+            foreign = True
+        else:
+            foreign = False
+        # 只清 .bak-*（它们同样会被 guard 判可疑），保留已有的 .ver*.dat：
+        # 那是上一局代理自己藏起来的副本，删掉 heal() 就没东西可搬回来。
+        _clean_extras(d, remove_alts=False, remove_baks=True)
+        last_err = None
+        for cand in _alt_candidates(d):
+            if os.path.exists(cand):
+                continue
+            try:
+                os.rename(cur, cand)
+                return True, os.path.basename(cand) + ("（非本工具部署的残留）" if foreign else "")
+            except FileNotFoundError:
+                if not os.path.isfile(cur):
+                    return False, "version.dll 已不在原位"
+            except OSError as exc:
+                last_err = exc
+        if last_err is not None:
+            return False, "改名失败: %s" % last_err
+        return False, "无可用 .ver*.dat 槽位"
+
+
+def cleanup_stale(remove_dll=False, skip_dirs=None):
+    """启动自愈：清理未锁定的 .bak-* 与非活跃目录中的孤立 .ver*.dat；按需清理残留我方 version.dll。"""
+    skip_set = {_norm_dir(p) for p in (skip_dirs or ()) if p}
+    counts = {"bak": 0, "alt": 0, "dll": 0}
+    with _STATE_LOCK:
+        state = _load_state()
+        hashes = _known_hashes(state)
+        installed = state.get("installed")
+        dirty = False
+        for d in battle_dirs():
+            is_active = _norm_dir(d) in skip_set
+            for b in _baks(d):
+                if os.path.isfile(b):
+                    ok, _ = _try_remove(b)
+                    if ok:
+                        counts["bak"] += 1
+            if is_active:
+                continue
+            for a in _alts(d):
+                if os.path.isfile(a):
+                    ok, _ = _try_remove(a)
+                    if ok:
+                        counts["alt"] += 1
+            if remove_dll:
+                cur = os.path.join(d, NAME)
+                if os.path.isfile(cur):
+                    try:
+                        if _md5(cur) in hashes:
+                            ok, _ = _try_remove(cur)
+                            if ok:
+                                counts["dll"] += 1
+                                if isinstance(installed, dict) and d in installed:
+                                    installed.pop(d, None)
+                                    dirty = True
+                    except OSError:
+                        pass
+                elif isinstance(installed, dict) and d in installed:
+                    installed.pop(d, None)
+                    dirty = True
+        if dirty:
+            state["ts"] = time.time()
+            _save_state(state)
+    return counts
+
+
+_APPCOMPAT_LAYERS_SUBKEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+
+
+def clear_battle_appcompat_shims() -> list[tuple[str, str, str]]:
+    """清理 HKCU/HKLM AppCompatFlags\\Layers 下针对 SSJJ_BattleClient_Unity.exe 的兼容层 Shim。
+
+    Windows PCA 自动写入的 `$ IgnoreFreeLibrary<npggNT>` 等 Shim 会触发 apphelp/AcLayers
+    在进程早期抢先加载 System32\\version.dll，导致同目录代理 version.dll 被完全绕过。
+    返回实际删除的条目列表：[(hive_label, value_name, value_data), ...]。
+    """
+    try:
+        import winreg
+    except ImportError:
+        return []
+    removed: list[tuple[str, str, str]] = []
+    targets = [
+        ("HKCU", winreg.HKEY_CURRENT_USER, winreg.KEY_WOW64_64KEY),
+        ("HKLM", winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+        ("HKCU(32)", winreg.HKEY_CURRENT_USER, winreg.KEY_WOW64_32KEY),
+        ("HKLM(32)", winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+    ]
+    for hive_label, hive, view in targets:
+        try:
+            key = winreg.OpenKey(hive, _APPCOMPAT_LAYERS_SUBKEY, 0,
+                                 winreg.KEY_READ | winreg.KEY_SET_VALUE | view)
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        try:
+            to_delete = []
+            idx = 0
+            while True:
+                try:
+                    name, val, _vtype = winreg.EnumValue(key, idx)
+                except OSError:
+                    break
+                idx += 1
+                low = str(name or "").strip().lower()
+                if (low == "ssjj_battleclient_unity.exe"
+                        or low.endswith("\\ssjj_battleclient_unity.exe")
+                        or low.endswith("/ssjj_battleclient_unity.exe")):
+                    to_delete.append((name, str(val)))
+            for name, val_str in to_delete:
+                try:
+                    winreg.DeleteValue(key, name)
+                    removed.append((hive_label, name, val_str))
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+        finally:
+            try:
+                winreg.CloseKey(key)
+            except Exception:
+                pass
+    return removed
+
+
+def heal(emit=None, skip_dirs=None):
+    """把被代理自己改名藏起来的 version.dll 补回来（严格跳过 skip_dirs 中的活跃目录）。
 
     代理定时器一启动就会把自身文件改名（.ver.dat，占不到就 .ver1.dat …），躲开
     RuntimeCheatGuard 的「exe 旁有可疑 DLL」目录扫描；所以跑过一局之后目录里没有
-    version.dll 了。工具箱闲置时调用这里恢复，否则下一局代理不会被加载。返回 (ok, msg)。"""
+    version.dll 了。战斗端彻底退出后调用这里恢复，否则下一局代理不会被加载。返回 (ok, msg)。"""
     src = dll_source()
+    shims_cleared = clear_battle_appcompat_shims()
+    if emit and shims_cleared:
+        emit("已清理 Windows 兼容层 Shim %d 条（防止抢先加载 System32\\version.dll）" % len(shims_cleared))
+    skip_set = {_norm_dir(p) for p in (skip_dirs or ()) if p}
     fixed, kept, stale, locked = 0, 0, 0, 0
     src_md5 = ""
     try:
         src_md5 = _md5(src) if src else ""
     except Exception:
         src_md5 = ""
-    for d in battle_dirs():
-        cur = os.path.join(d, NAME)
-        alts = _alts(d)
-        if os.path.isfile(cur):
-            fresh = True
-            try:
-                fresh = (not src_md5) or _md5(cur) == src_md5
-            except Exception:
+    with _STATE_LOCK:
+        state = _load_state()
+        installed = state.setdefault("installed", {})
+        dirty = False
+        now = time.time()
+        for d in battle_dirs():
+            if _norm_dir(d) in skip_set:
+                continue
+            cur = os.path.join(d, NAME)
+            alts = _alts(d)
+            if os.path.isfile(cur):
+                cur_md5 = ""
                 fresh = True
-            if not fresh and src:        # 目录里是旧版本代理：换成本次的
+                try:
+                    cur_md5 = _md5(cur)
+                    fresh = (not src_md5) or cur_md5 == src_md5
+                except Exception:
+                    fresh = True
+                if not fresh and src:        # 目录里是旧版本代理：换成本次的
+                    try:
+                        shutil.copy2(src, cur)
+                        fixed += 1
+                        installed[d] = {"ts": now, "md5": src_md5}
+                        dirty = True
+                    except Exception as e:
+                        locked += 1
+                        if emit:
+                            emit("代理文件被占用，本局先用目录里已有的版本（重启电脑后自动更新）：%s（%s）" % (d, e))
+                else:
+                    kept += 1
+                    rec_md5 = cur_md5 or src_md5
+                    prev = installed.get(d)
+                    if rec_md5 and (not isinstance(prev, dict) or prev.get("md5") != rec_md5):
+                        installed[d] = {"ts": now, "md5": rec_md5, "existing": True}
+                        dirty = True
+                alt_n, _bak_n = _clean_extras(d, remove_alts=True, remove_baks=True)
+                stale += alt_n
+                continue
+            moved = False
+            for a in alts:
+                try:
+                    a_md5 = _md5(a)
+                    if src_md5 and a_md5 != src_md5:   # 旧版本残影，搬回来也没用
+                        os.remove(a)
+                        stale += 1
+                        continue
+                    os.replace(a, cur)
+                    fixed += 1
+                    moved = True
+                    installed[d] = {"ts": now, "md5": src_md5 or a_md5}
+                    dirty = True
+                    break
+                except Exception:
+                    continue
+            if moved:
+                alt_n, _bak_n = _clean_extras(d, remove_alts=True, remove_baks=True)
+                stale += alt_n
+            elif src:
                 try:
                     shutil.copy2(src, cur)
                     fixed += 1
+                    installed[d] = {"ts": now, "md5": src_md5}
+                    dirty = True
+                    _clean_extras(d, remove_alts=False, remove_baks=True)
                 except Exception as e:
-                    locked += 1
                     if emit:
-                        emit("代理文件被占用，本局先用目录里已有的版本（重启电脑后自动更新）：%s（%s）" % (d, e))
-            else:
-                kept += 1
-            for a in alts:          # 有 version.dll 时把藏起来的副本清掉
-                try:
-                    os.remove(a)
-                    stale += 1
-                except Exception:
-                    pass
-            continue
-        moved = False
-        for a in alts:
-            try:
-                if src_md5 and _md5(a) != src_md5:   # 旧版本残影，搬回来也没用
-                    os.remove(a)
-                    stale += 1
-                    continue
-                os.replace(a, cur)
-                fixed += 1
-                moved = True
-                break
-            except Exception:
-                continue
-        if not moved and src:
-            try:
-                shutil.copy2(src, cur)
-                fixed += 1
-            except Exception as e:
-                if emit:
-                    emit("补回代理失败 %s（%s）" % (d, e))
+                        emit("补回代理失败 %s（%s）" % (d, e))
+        if dirty:
+            if src_md5:
+                state["md5"] = src_md5
+            state["ts"] = now
+            _save_state(state)
     msg = "代理文件：正常 %d 个、补回 %d 个" % (kept, fixed)
     if stale:
         msg += "、清掉旧残留 %d 个" % stale
@@ -234,6 +503,9 @@ def install(dirs=None, emit=None, all_dirs=True):
     src = dll_source()
     if not src:
         return False, "找不到代理 DLL（risk\\proxy\\version.dll），先跑 risk\\proxy\\build_proxy.py"
+    shims_cleared = clear_battle_appcompat_shims()
+    if emit and shims_cleared:
+        emit("已清理 Windows 兼容层 Shim %d 条（防止抢先加载 System32\\version.dll）" % len(shims_cleared))
 
     targets = dirs or battle_dirs()
     if not targets:
@@ -247,39 +519,35 @@ def install(dirs=None, emit=None, all_dirs=True):
             live = None
         targets = [live] if live in targets else [targets[0]]
 
-    state = _load_state()
-    state.setdefault("installed", {})
-    done, failed = [], []
-    for d in targets:
-        dst = os.path.join(d, NAME)
-        try:
-            if os.path.isfile(dst):
-                if _md5(dst) == _md5(src):
-                    state["installed"][d] = {"ts": time.time(), "md5": _md5(src), "skip": True}
-                    done.append(d)
-                    continue
-                # 清掉历史备份：exe 旁边堆一堆 version.dll.bak-* 会被游戏自检当成
-                # 「exe 旁有可疑 DLL」，所以每次部署前先扫干净
-                for old in glob.glob(dst + ".bak-*"):
-                    try:
-                        os.remove(old)
-                    except OSError:
-                        pass
-                bak = dst + time.strftime(".bak-%Y%m%d-%H%M%S")
-                shutil.move(dst, bak)
-                if emit:
-                    emit("已有 version.dll，已备份为 %s" % os.path.basename(bak))
-            shutil.copy2(src, dst)
-            state["installed"][d] = {"ts": time.time(), "md5": _md5(src)}
-            done.append(d)
-        except PermissionError:
-            failed.append("%s（被占用，先关游戏）" % d)
-        except Exception as e:
-            failed.append("%s（%s）" % (d, e))
+    src_md5 = _md5(src)
+    with _STATE_LOCK:
+        state = _load_state()
+        state.setdefault("installed", {})
+        done, failed = [], []
+        for d in targets:
+            dst = os.path.join(d, NAME)
+            try:
+                _clean_extras(d, remove_alts=True, remove_baks=True)
+                if os.path.isfile(dst):
+                    if _md5(dst) == src_md5:
+                        state["installed"][d] = {"ts": time.time(), "md5": src_md5, "skip": True}
+                        done.append(d)
+                        continue
+                    bak = dst + time.strftime(".bak-%Y%m%d-%H%M%S")
+                    shutil.move(dst, bak)
+                    if emit:
+                        emit("已有 version.dll，已备份为 %s" % os.path.basename(bak))
+                shutil.copy2(src, dst)
+                state["installed"][d] = {"ts": time.time(), "md5": src_md5}
+                done.append(d)
+            except PermissionError:
+                failed.append("%s（被占用，先关游戏）" % d)
+            except Exception as e:
+                failed.append("%s（%s）" % (d, e))
 
-    state["ts"] = time.time()
-    state["md5"] = _md5(src)
-    _save_state(state)
+        state["ts"] = time.time()
+        state["md5"] = src_md5
+        _save_state(state)
 
     if emit:
         for d in done:
@@ -295,30 +563,46 @@ def install(dirs=None, emit=None, all_dirs=True):
 
 
 def uninstall(emit=None):
-    """删掉我们放的代理（保留用户原有的 version.dll 备份不还原，只是提示）。"""
-    state = _load_state()
-    want = our_md5()
-    removed, kept = [], []
-    for d in any_version_dll():
-        f = os.path.join(d, NAME)
-        try:
-            mine = bool(want) and _md5(f) == want
-            if mine:
-                os.remove(f)
-                removed.append(d)
-            else:
-                kept.append(d)
-        except Exception:
-            kept.append(d)
-    state["installed"] = {}
-    state["ts"] = time.time()
-    _save_state(state)
+    """移除确认属于本工具的代理，包括运行时改名的 .ver*.dat 与备份 version.dll.bak-*。"""
+    with _STATE_LOCK:
+        state = _load_state()
+        hashes = _known_hashes(state)
+        removed, kept, failed = [], [], []
+        for d in battle_dirs():
+            for f in [os.path.join(d, NAME)] + _alts(d):
+                if not os.path.isfile(f):
+                    continue
+                try:
+                    if _md5(f) not in hashes:
+                        kept.append(f)
+                        continue
+                    os.remove(f)
+                    removed.append(f)
+                except OSError as exc:
+                    failed.append("%s (%s)" % (f, exc))
+            for bak in _baks(d):
+                if not os.path.isfile(bak):
+                    continue
+                try:
+                    os.remove(bak)
+                    removed.append(bak)
+                except OSError as exc:
+                    failed.append("%s (%s)" % (bak, exc))
+        if not failed:
+            state["installed"] = {}
+        state["ts"] = time.time()
+        _save_state(state)
     if emit:
-        for d in removed:
-            emit("已移除代理 DLL: %s" % d)
-        for d in kept:
-            emit("保留（不是我们的文件）: %s" % d)
-    return True, "已移除 %d 个目录的代理 DLL" % len(removed)
+        for f in removed:
+            emit("已移除代理文件: %s" % f)
+        for f in kept:
+            emit("保留（无法确认属于本工具）: %s" % f)
+        for f in failed:
+            emit("移除失败: %s" % f)
+    msg = "已移除 %d 个代理文件；保留 %d 个其他文件" % (len(removed), len(kept))
+    if failed:
+        msg += "；%d 个移除失败：%s" % (len(failed), "；".join(failed))
+    return not failed, msg
 
 
 def status():

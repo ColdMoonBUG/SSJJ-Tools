@@ -88,8 +88,34 @@ namespace SsjjRisk
             return Path.Combine(Path.GetTempPath(), "ssjj_risk.log");
         }
 
+        static int _verboseFlag = -1; // -1=未检测, 0=静默, 1=开启日志
+
+        /// <summary>
+        /// 默认写日志：只认「显式关闭」。旧实现是「文件存在才写」，结果默认全静默，
+        /// 用户那边表现成「注入成功但 risk_inject.log 一行不涨」，诊断包拿不到现场。
+        /// 想要干净就写 off/0/false/no 到 risk_verbose.txt。
+        /// </summary>
+        static bool IsVerbose()
+        {
+            if (_verboseFlag >= 0) return _verboseFlag == 1;
+            try
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "ssjj-toolbox");
+                string f = Path.Combine(dir, "risk_verbose.txt");
+                if (!File.Exists(f)) { _verboseFlag = 1; return true; }
+                string v = "";
+                try { v = File.ReadAllText(f).Trim().ToLowerInvariant(); } catch { }
+                _verboseFlag = (v == "off" || v == "0" || v == "false" || v == "no") ? 0 : 1;
+            }
+            catch { _verboseFlag = 1; }
+            return _verboseFlag == 1;
+        }
+
         public static void Log(string msg)
         {
+            if (!IsVerbose()) return;
             lock (_lock)
             {
                 string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg + Environment.NewLine;

@@ -25,14 +25,29 @@ DIST = ROOT / "dist"
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     deploy = "--deploy" in argv
+    dist_arg = next((a.split("=", 1)[1] for a in argv if a.startswith("--dist-dir=")), None)
+    dist = Path(dist_arg).resolve() if dist_arg else DIST
 
     if not ENTRY.is_file():
         raise SystemExit("找不到入口: %s" % ENTRY)
+
+    # 代理将托管载荷直接编进 version.dll。每次打包先重编这两层，
+    # 否则 exe 会携带上次的代理，即使 payload/bin 已经是新版本。
+    if "--use-existing-proxy" not in argv:
+        from risk import injector
+        payload, lines = injector.csc_build()
+        for line in lines:
+            print(line)
+        if not payload:
+            raise SystemExit("载荷编译失败，停止打包")
+        subprocess.run([sys.executable, str(ROOT / "risk" / "proxy" / "build_proxy.py"),
+                        "--payload", payload], cwd=str(ROOT), check=True)
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean", "--onefile", "--noconsole", "--uac-admin",
         "--name", NAME,
+        "--distpath", str(dist),
         "--paths", str(ROOT),            # ssjj_paths / local_cdn / risk
         "--paths", str(ENTRY.parent),    # backend / ui
         # 预编译载荷：打包版没有 dotnet，注入时只能读包内这一份
@@ -59,6 +74,7 @@ def main(argv=None):
     # PyInstaller 静态分析看不到，必须在命令行里逐个点名，否则打包版点「风险」页
     # 直接 ModuleNotFoundError。
     for mod in ("quick_login", "skin_swap", "skin_pack", "oneclick",
+                "updater", "diagnostics", "ui.diagnostic_export",
                 "risk", "risk.config", "risk.paths", "risk.swfpatch", "risk.airdesc",
                 "risk.lobby", "risk.injector", "risk.mitm", "risk.guard",
                 "risk.proxy", "risk.proxy.build_proxy", "risk.privilege",
@@ -74,7 +90,7 @@ def main(argv=None):
     if rc != 0:
         print("[!] PyInstaller 失败，退出码 %d" % rc)
         return rc
-    exe = DIST / (NAME + ".exe")
+    exe = dist / (NAME + ".exe")
     if not exe.is_file():
         print("[!] 没找到产物: %s" % exe)
         return 3
@@ -114,7 +130,8 @@ def main(argv=None):
             "   游戏目录写文件）。\r\n"
             "2. 首页「一键启动」：选武器 → 选想借用的皮肤 → 填账号密码和区服 → 点\r\n"
             "   「一键启动」。工具箱会自己部署代理、写规则、登录、拉起游戏。\r\n"
-            "3. 想停用换肤：侧栏「换肤注入」→ 点「移除代理」，下次进游戏就是原样。\r\n\r\n"
+            "3. 想停用换肤：在首页「一键启动」页「⑤ 高级开关」点「移除代理」（正常关闭\r\n"
+            "   工具箱也会自动清理已投放的代理文件），下次进游戏就是原样。\r\n\r\n"
             "【换肤是怎么进去的】\r\n"
             "- 加载方式是「代理 DLL」：工具箱往游戏的 battle\\*_64\\ 目录写一个\r\n"
             "  version.dll。战斗端启动时 Windows 加载器会先加载它，载荷在游戏进程\r\n"
@@ -122,8 +139,8 @@ def main(argv=None):
             "- 全程不 OpenProcess、不 VirtualAllocEx、不 CreateRemoteThread、不留匿名\r\n"
             "  可执行页 —— 那套跨进程注入会被 GameGuard 当场杀掉（npggNT64.des 报\r\n"
             "  0x80000004），代理 DLL 是唯一能活下来的通道。\r\n"
-            "- 代理一进进程就把自己从模块链表里摘掉、文件改名成 .ver.dat，绕开游戏\r\n"
-            "  自带的 RuntimeCheatGuard 自检；全程不新开线程，载荷跑在主线程定时器上。\r\n"
+            "- 代理一进进程就把自己从模块链表里摘掉并伪装系统路径，同时由自身定时器与\r\n"
+            "  工具箱守护进程协同将文件快速改名成 .ver.dat，绕开 RuntimeCheatGuard 自检。\r\n"
             "- 换肤规则是「冷加载」：进场应用一次就结束，进程里不留常驻线程。\r\n\r\n"
             "【生效时机】\r\n"
             "- 代理部署后新开一局生效；改规则要退出这一局、重进一局才生效。\r\n"

@@ -286,6 +286,26 @@ class RiskPage(ScrollPage):
 
         self.run(job, on_done=done)
 
+    def _export_diagnostics(self):
+        destination = choose_diagnostic_path(self)
+        if not destination:
+            return
+        self.btn_export.setEnabled(False)
+        self.lb_inj_msg.setText("正在汇总本次会话、游戏日志和 Windows 崩溃事件…")
+
+        def job(_w):
+            try:
+                return True, backend.export_diagnostics(destination)
+            except Exception as exc:
+                return False, repr(exc)
+
+        def done(result):
+            self.btn_export.setEnabled(True)
+            ok, msg = result or (False, "导出未完成")
+            self.lb_inj_msg.setText(("诊断文件已保存：" if ok else "导出失败：") + str(msg))
+
+        self.run(job, on_done=done)
+
     # ------------------------------------------------------------ 动作
     def _enable(self):
         if self._busy:
