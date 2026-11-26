@@ -1,14 +1,35 @@
 # -*- coding: utf-8 -*-
+import inspect
+import threading
+import time
+
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QCheckBox, QGridLayout, QHBoxLayout, QLabel,
-                               QMessageBox, QPushButton)
+                               QMessageBox, QProgressBar, QPushButton)
 
 import backend
 from ui.diagnostic_export import choose_diagnostic_path
 from ui.widgets import Badge, Card, ScrollPage, dim, page_header
 
 RELEASES_URL = "https://github.com/ColdMoonBUG/SSJJ-Tools/releases"
+
+
+def _fmt_speed(bps):
+    if bps <= 0:
+        return ""
+    if bps >= 1048576.0:
+        return "%.2f MB/s" % (bps / 1048576.0)
+    return "%.0f KB/s" % (bps / 1024.0)
+
+
+def _fmt_eta(seconds):
+    if seconds <= 0 or seconds > 36000:
+        return ""
+    sec = int(seconds)
+    if sec >= 60:
+        return "剩余 %d分%02d秒" % (sec // 60, sec % 60)
+    return "剩余 %d秒" % sec
 
 
 class ToolsPage(ScrollPage):
@@ -18,6 +39,7 @@ class ToolsPage(ScrollPage):
         super().__init__(app)
         self._busy = False
         self._latest_info = None
+        self._upd_cancel = None
 
         self.root.addWidget(page_header(
             "设置", "软件更新、诊断日志导出与常用目录。服务与 hosts 已全部整合至「本地加速」页。"))
@@ -41,14 +63,37 @@ class ToolsPage(ScrollPage):
         self.btn_pull_upd.setObjectName("Primary")
         self.btn_pull_upd.setEnabled(False)
         self.btn_pull_upd.clicked.connect(self._pull_update)
+        self.btn_cancel_upd = QPushButton("取消下载")
+        self.btn_cancel_upd.setVisible(False)
+        self.btn_cancel_upd.clicked.connect(self._cancel_update)
         self.btn_open_rel = QPushButton("打开发布页")
         self.btn_open_rel.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl(RELEASES_URL)))
         r_upd.addWidget(self.btn_check_upd)
         r_upd.addWidget(self.btn_pull_upd)
+        r_upd.addWidget(self.btn_cancel_upd)
         r_upd.addWidget(self.btn_open_rel)
         r_upd.addStretch(1)
         upd.add_layout(r_upd)
+
+        self.prog_upd = QProgressBar()
+        self.prog_upd.setRange(0, 100)
+        self.prog_upd.setValue(0)
+        self.prog_upd.setTextVisible(True)
+        self.prog_upd.setFixedHeight(16)
+        self.prog_upd.setStyleSheet(
+            "QProgressBar {"
+            "  background: #0f172a; border: 1px solid #1e293b; border-radius: 8px;"
+            "  text-align: center; font-size: 11px; color: #f8fafc;"
+            "}"
+            "QProgressBar::chunk {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            "    stop:0 #0ea5e9, stop:0.5 #38bdf8, stop:1 #6366f1);"
+            "  border-radius: 7px;"
+            "}"
+        )
+        self.prog_upd.setVisible(False)
+        upd.add(self.prog_upd)
 
         self.lb_upd_msg = dim("点击「检查更新」查看 GitHub 最新版本；仅拉取 .exe 便携包。", small=True)
         self.lb_upd_msg.setWordWrap(True)
@@ -133,6 +178,10 @@ class ToolsPage(ScrollPage):
 
     def apply_update_info(self, info):
         if not isinstance(info, dict):
+            self.badge_upd.setText("检查失败")
+            self.badge_upd.state("bad")
+            self.lb_upd_msg.setText("检查更新异常，请检查网络后重试，或点击「打开发布页」手动查看。")
+            self.btn_pull_upd.setEnabled(False)
             return
         self._latest_info = info
         if not info.get("ok"):
@@ -181,41 +230,142 @@ class ToolsPage(ScrollPage):
 
         self.run(job, on_done=done)
 
+    def _cancel_update(self):
+        if self._upd_cancel is not None:
+            self._upd_cancel.set()
+        self.btn_cancel_upd.setEnabled(False)
+        self.badge_upd.setText("取消中…")
+        self.badge_upd.state("")
+        self.lb_upd_msg.setText("正在取消下载，请稍候…")
+
+    def _on_upd_progress(self, pct, detail):
+        if pct < 0:
+            if self.prog_upd.maximum() != 0:
+                self.prog_upd.setRange(0, 0)
+        else:
+            if self.prog_upd.maximum() != 100:
+                self.prog_upd.setRange(0, 100)
+            self.prog_upd.setValue(max(0, min(100, int(pct))))
+        if detail:
+            self.lb_upd_msg.setText(detail)
+
     def _pull_update(self):
         info = self._latest_info or {}
         url = info.get("download_url")
         asset = info.get("asset_name")
         size = info.get("asset_size") or 0
+        expected_sha256 = str(info.get("asset_sha256") or "").strip()
         if not url:
             self.lb_upd_msg.setText("请先点击「检查更新」获取下载地址。")
             return
         if self._busy:
             return
         self._busy = True
+        self._upd_cancel = threading.Event()
+        cancel_ev = self._upd_cancel
         self.btn_check_upd.setEnabled(False)
         self.btn_pull_upd.setEnabled(False)
+        self.btn_cancel_upd.setEnabled(True)
+        self.btn_cancel_upd.setVisible(True)
+        self.prog_upd.setRange(0, 0)
+        self.prog_upd.setVisible(True)
         self.badge_upd.setText("下载中…")
-        self.lb_upd_msg.setText("正在下载 %s…" % (asset or "新版本"))
+        self.badge_upd.state("")
+        self.lb_upd_msg.setText("正在连接加速线路，准备下载 %s…" % (asset or "新版本"))
 
         def job(w):
-            def on_prog(got, total):
+            state = {
+                "mirror": "",
+                "last_emit": 0.0,
+                "last_t": time.monotonic(),
+                "last_got": 0,
+                "speed": 0.0,
+            }
+
+            def on_status(msg):
+                text = str(msg or "").strip()
+                if not text:
+                    return
+                state["mirror"] = text
+                w.progress.emit(-1, text)
+
+            def on_prog(got, total, *extra):
+                now = time.monotonic()
+                mirror = state["mirror"]
+                ext_speed = None
+                for item in extra:
+                    if isinstance(item, str) and item.strip():
+                        mirror = item.strip()
+                        state["mirror"] = mirror
+                    elif isinstance(item, (int, float)) and item >= 0:
+                        ext_speed = float(item)
+                if got < state["last_got"]:
+                    state["last_got"] = 0
+                    state["last_t"] = now
+                    state["speed"] = 0.0
+                dt = now - state["last_t"]
+                if ext_speed is not None:
+                    state["speed"] = ext_speed
+                elif dt >= 0.25:
+                    inst = (got - state["last_got"]) / dt
+                    state["speed"] = inst if state["speed"] <= 0 else (state["speed"] * 0.6 + inst * 0.4)
+                    state["last_got"] = got
+                    state["last_t"] = now
+                if got > 0 and (total <= 0 or got < total) and (now - state["last_emit"]) < 0.1:
+                    return
+                state["last_emit"] = now
+                parts = []
                 if total > 0:
                     pct = min(100, int(got * 100 / total))
-                    w.log.emit("正在下载 %s：%d%%（%.1f / %.1f MB）"
-                               % (asset, pct, got / 1048576.0, total / 1048576.0))
+                    parts.append("%d%%" % pct)
+                    parts.append("%.1f / %.1f MB" % (got / 1048576.0, total / 1048576.0))
                 else:
-                    w.log.emit("正在下载 %s：%.1f MB…" % (asset, got / 1048576.0))
+                    pct = -1
+                    parts.append("%.1f MB" % (got / 1048576.0))
+                sp = _fmt_speed(state["speed"])
+                if sp:
+                    parts.append(sp)
+                if total > got > 0 and state["speed"] > 0:
+                    eta = _fmt_eta((total - got) / state["speed"])
+                    if eta:
+                        parts.append(eta)
+                if mirror:
+                    parts.append(mirror)
+                w.progress.emit(pct, " · ".join(parts))
 
-            return backend.download_update(url, asset, expected_size=size, progress_cb=on_prog)
+            kwargs = {"expected_size": size, "progress_cb": on_prog}
+            try:
+                params = inspect.signature(backend.download_update).parameters
+                if "cancel_event" in params:
+                    kwargs["cancel_event"] = cancel_ev
+                if "status_cb" in params:
+                    kwargs["status_cb"] = on_status
+                if "expected_sha256" in params and expected_sha256:
+                    kwargs["expected_sha256"] = expected_sha256
+            except (TypeError, ValueError):
+                pass
+            return backend.download_update(url, asset, **kwargs)
 
         def done(res):
+            was_cancelled = bool(cancel_ev.is_set())
             self._busy = False
+            self._upd_cancel = None
+            self.prog_upd.setVisible(False)
+            self.prog_upd.setRange(0, 100)
+            self.prog_upd.setValue(0)
+            self.btn_cancel_upd.setVisible(False)
+            self.btn_cancel_upd.setEnabled(True)
             self.btn_check_upd.setEnabled(True)
             ok, msg, saved_path, bat_path = res or (False, "下载未完成", "", "")
             if not ok:
-                self.badge_upd.setText("下载失败")
-                self.badge_upd.state("bad")
-                self.lb_upd_msg.setText("拉取更新失败：" + str(msg))
+                if was_cancelled or "取消" in str(msg):
+                    self.badge_upd.setText("已取消")
+                    self.badge_upd.state("")
+                    self.lb_upd_msg.setText("已取消下载，可随时点击「立即拉取更新」重新下载。")
+                else:
+                    self.badge_upd.setText("下载失败")
+                    self.badge_upd.state("bad")
+                    self.lb_upd_msg.setText("拉取更新失败：%s（可重试或点「打开发布页」手动下载）" % msg)
                 self.btn_pull_upd.setEnabled(True)
                 return
             self.badge_upd.setText("下载完成")
@@ -233,7 +383,7 @@ class ToolsPage(ScrollPage):
                     backend.launch_update_script(bat_path)
                     self.app.close()
 
-        self.run(job, on_log=self.lb_upd_msg.setText, on_done=done)
+        self.run(job, on_done=done, log=self.lb_upd_msg.setText, progress=self._on_upd_progress)
 
     # ------------------------------------------------------------ 诊断日志导出
     def _export_diagnostics(self):

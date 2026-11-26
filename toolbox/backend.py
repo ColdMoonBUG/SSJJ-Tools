@@ -1174,10 +1174,17 @@ def check_update():
     return U.check_update()
 
 
-def download_update(download_url, asset_name, expected_size=0, progress_cb=None):
+def download_update(download_url, asset_name, expected_size=0, progress_cb=None,
+                    cancel_event=None, status_cb=None, expected_sha256=""):
     import updater as U
-    return U.download_update(download_url, asset_name, expected_size=expected_size,
-                             progress_cb=progress_cb)
+    return U.download_update(
+        download_url, asset_name,
+        expected_size=expected_size,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        status_cb=status_cb,
+        expected_sha256=expected_sha256,
+    )
 
 
 def launch_update_script(bat_path):
