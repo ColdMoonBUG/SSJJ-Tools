@@ -44,15 +44,15 @@ class SettingsPageTest(unittest.TestCase):
                 self.assertIn(dest, page.lb_export_msg.text())
 
     def test_updater_version_and_exe_asset(self):
-        self.assertTrue(updater.is_newer("v1.1.10", "1.1.9"))
-        self.assertFalse(updater.is_newer("1.1.9", "1.1.9"))
-        self.assertFalse(updater.is_newer("1.1.8", "1.1.9"))
+        self.assertTrue(updater.is_newer("v1.1.11", "1.1.10"))
+        self.assertFalse(updater.is_newer("1.1.10", "1.1.10"))
+        self.assertFalse(updater.is_newer("1.1.9", "1.1.10"))
         picked = updater._pick_exe_asset([
             {"name": "notes.zip", "size": 99999999, "browser_download_url": "https://x/a.zip"},
-            {"name": "生死狙击工具箱-1.1.10.exe", "size": 54000000, "browser_download_url": "https://x/a.exe"},
+            {"name": "生死狙击工具箱-1.1.11.exe", "size": 54000000, "browser_download_url": "https://x/a.exe"},
         ])
         self.assertIsNotNone(picked)
-        self.assertEqual(picked["name"], "生死狙击工具箱-1.1.10.exe")
+        self.assertEqual(picked["name"], "生死狙击工具箱-1.1.11.exe")
 
     def test_tools_page_has_progress_bar_cancel_and_no_invalid_on_log(self):
         tools_src = (ROOT / "toolbox" / "ui" / "pages" / "tools.py").read_text(encoding="utf-8")
