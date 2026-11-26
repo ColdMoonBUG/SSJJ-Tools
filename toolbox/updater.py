@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-APP_VERSION = "1.1.10"
+APP_VERSION = "1.1.11"
 GITHUB_OWNER = "ColdMoonBUG"
 GITHUB_REPO = "SSJJ-Tools"
 RELEASES_API = "https://api.github.com/repos/%s/%s/releases/latest" % (GITHUB_OWNER, GITHUB_REPO)

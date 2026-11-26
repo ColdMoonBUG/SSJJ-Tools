@@ -616,9 +616,8 @@ static u32 __stdcall worker(void *arg)
         if (g_done) return 0;
         HMODULE mono = GetModuleHandleA("mono-2.0-bdwgc.dll");
         if (mono) {
-            /* 等待 Mono 完成初始化：不要在刚映射到模块列表就立刻调 mono_thread_attach，
-               否则与 Unity 主线程 mono_jit_init 竞态会触发 mono-2.0-bdwgc.dll 0xc0000409 闪退。
-               先轮询 mono_get_root_domain() 非空（最多 ~15s），再做 450ms 稳定缓冲（优先让位给主线程 on_timer）。 */
+            /* 等待 Mono 完成 root_domain 初始化：避免在刚映射进进程时立刻调 mono_thread_attach 触发 0xc0000409，
+               同时以 10ms 高频轮询且不做额外延迟，一旦 root_domain 非空立即抢在 npggNT64.des 激活前注入。 */
             fn_root p_root = (fn_root)GetProcAddress(mono, "mono_get_root_domain");
             if (!p_root) {
                 plog("[proxy] 找不到 mono_get_root_domain（线程路径），放弃");
@@ -626,22 +625,18 @@ static u32 __stdcall worker(void *arg)
             }
             int j;
             void *dom = 0;
-            for (j = 0; j < 600; j++) {
+            for (j = 0; j < 1500; j++) {
                 if (g_done) return 0;
                 dom = p_root();
                 if (dom) break;
-                Sleep(25);
+                Sleep(10);
             }
             if (!dom) {
                 plog("[proxy] 等待 mono root_domain 超时（线程路径），放弃");
                 return 0;
             }
-            for (j = 0; j < 18; j++) {
-                if (g_done) return 0;
-                Sleep(25);
-            }
             if (_InterlockedCompareExchange(&g_done, 1, 0) == 0) {
-                plog("[proxy] mono root_domain 已就位，缓冲后执行注入（线程路径）");
+                plog("[proxy] mono root_domain 已就位，立即执行注入（线程路径）");
                 run_payload(mono);
             }
             return 0;
