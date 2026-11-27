@@ -34,7 +34,8 @@ public class View : IFakeView, Assets.Sources.Components.Interface.Info.AnimStat
     public View(int state)
     {
         StateId = state;
-        AnimationName = state == 170 ? "light-second" : "other";
+        IsLoop = (state == 13 || state == 39);
+        AnimationName = state == 170 ? "light-second" : state == 13 ? "idle" : "other";
     }
     public int StateId { get; set; }
     public bool IsLoop { get; set; }
@@ -45,7 +46,7 @@ public class AnimInfo : IFakeWeaponInfo
 {
     public int GetViewAnimDuration(int state) =>
         state == 44 ? 6033 : state == 20 ? 1600 : state == 31 ? 900 :
-        state == 170 ? 1433 : state == 29 ? 0 : 800;
+        state == 170 ? 1433 : state == 16 ? 467 : state == 29 ? 0 : 800;
 }
 public interface IFakeAnimator
 {
@@ -57,12 +58,14 @@ public class Animator : IFakeAnimator
 {
     public string Name;
     public float Time;
+    public float Speed;
     public float GetAnimDuration(int layer, string name) => 6.033f;
     public void PlayAtFixedTime(int layer, string name, float time, float speed,
                                 bool loop, bool reverse, float transition, bool visible)
     {
         Name = name;
         Time = time;
+        Speed = speed;
     }
 }
 public class ViewSystem
@@ -79,7 +82,8 @@ namespace SsjjRisk
     internal static class WeaponSwapper
     {
         public static string ResolveModelWeapon(string name) =>
-            name == "brick_knife_gold" ? "butterfly_knife" : name;
+            name == "brick_knife_gold" ? "butterfly_knife" :
+            name == "verdict_legend2" ? "awm_legend_t" : name;
     }
 }
 public static class Program
@@ -107,6 +111,24 @@ public static class Program
             replacement.DynamicInvoke(args);
             time = (int)args[4];
         }
+
+        // 冷启动（_contextsType == null，尚未触发过 V 检视）直接测试 state=16 切枪方案 B
+        Contexts.sharedInstance.player.myPlayerEntity.currentWeapon.WeaponInfo.Name = "verdict_legend2";
+        var raise = new View { StateId = 16, AnimationName = "raise" };
+        Frame(raise, 1300);
+        Check(hand.Name == "raise" && hand.Time >= 0f && hand.Time < 0.1f && Math.Abs(hand.Speed - 1f) < 0.001f,
+              "cold-start raise stage 1 must play at 1.0x from 0ms without negative freeze");
+        var raiseField = typeof(InspectPlayback).GetField("_raise",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        object raiseClock = raiseField.GetValue(null);
+        Check(raiseClock != null, "cold-start raise must initialize _raise clock");
+        raiseClock.GetType().GetField("Started", BindingFlags.Instance | BindingFlags.NonPublic)
+                  .SetValue(raiseClock, Stopwatch.GetTimestamp() - Stopwatch.Frequency / 2);
+        Frame(raise, 800);
+        Check(hand.Name == "idle" && Math.Abs(hand.Speed - 1f) < 0.001f && hand.Time >= 0f,
+              "raise stage 2 after targetDur must smoothly switch to TORSO_STAND idle");
+        Contexts.sharedInstance.player.myPlayerEntity.currentWeapon.WeaponInfo.Name = "brick_knife_gold";
+        Frame(idle, 500);
 
         Frame(inspect, 2988);
         Check(hand.Name == "showgun" && hand.Time < 0.2f && time == 3045,

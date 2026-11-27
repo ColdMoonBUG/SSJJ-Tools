@@ -39,7 +39,10 @@ import threading
 import time
 from pathlib import Path
 
-NAME = "version.dll"
+NAME = "hid.dll"
+RENAMED = ".hid.dat"
+LEGACY_NAME = "version.dll"
+LEGACY_RENAMED = ".ver.dat"
 _STATE_LOCK = threading.RLock()
 
 try:
@@ -124,9 +127,14 @@ def deployed():
     return out
 
 
-def any_version_dll():
-    """battle 目录里存在 version.dll 的（不论是不是我们的）。"""
+def any_hid_dll():
+    """battle 目录里存在 hid.dll 的（不论是不是我们的）。"""
     return [d for d in battle_dirs() if os.path.isfile(os.path.join(d, NAME))]
+
+
+def any_version_dll():
+    """battle 目录里存在旧版 version.dll 残留的（不论是不是我们的）。"""
+    return [d for d in battle_dirs() if os.path.isfile(os.path.join(d, LEGACY_NAME))]
 
 
 def _load_state():
@@ -147,42 +155,60 @@ def _save_state(d):
         pass
 
 
-RENAMED = ".ver.dat"
-
-
 def _norm_dir(p):
     return os.path.normcase(os.path.abspath(os.fspath(p)))
 
 
 def _alt_candidates(d):
-    """目录里代理可能藏成的全部候选路径：.ver.dat / .ver1.dat … .ver9.dat"""
+    """目录里代理可能藏成的全部候选路径：.hid.dat / .hid1.dat … .hid9.dat"""
     d = os.fspath(d)
-    return [os.path.join(d, RENAMED)] + [os.path.join(d, ".ver%d.dat" % i) for i in range(1, 10)]
+    return [os.path.join(d, RENAMED)] + [os.path.join(d, ".hid%d.dat" % i) for i in range(1, 10)]
 
 
 def _alts(d):
-    """目录里代理可能藏成的名字：.ver.dat / .ver1.dat … .ver9.dat"""
+    """目录里代理可能藏成的名字：.hid.dat / .hid1.dat … .hid9.dat"""
     return [p for p in _alt_candidates(d) if os.path.isfile(p)]
 
 
 def _baks(d):
-    """目录里历史备份 version.dll.bak-*。"""
+    """目录里历史备份 hid.dll.bak-*。"""
     return [p for p in sorted(glob.glob(os.path.join(os.fspath(d), NAME + ".bak-*"))) if os.path.isfile(p)]
 
 
-def _system_version_md5():
-    """系统真身 version.dll 的 md5（缓存）。用来区分「别人的 DLL」与「Windows 自己的」。"""
-    global _SYS_MD5
-    if _SYS_MD5 is not None:
-        return _SYS_MD5
+def _legacy_alts(d):
+    """目录里旧版 version.dll 代理可能遗留的 .ver.dat / .ver1.dat … .ver9.dat。"""
+    d = os.fspath(d)
+    cands = [os.path.join(d, LEGACY_RENAMED)] + [os.path.join(d, ".ver%d.dat" % i) for i in range(1, 10)]
+    return [p for p in cands if os.path.isfile(p)]
+
+
+def _legacy_baks(d):
+    """目录里旧版历史备份 version.dll.bak-*。"""
+    return [p for p in sorted(glob.glob(os.path.join(os.fspath(d), LEGACY_NAME + ".bak-*"))) if os.path.isfile(p)]
+
+
+_SYS_MD5_CACHE: dict[str, str] = {}
+
+
+def _system_dll_md5(dll_name=NAME):
+    """系统真身 System32 DLL 的 md5（缓存）。用来区分「别人的 DLL」与「Windows 自己的」。"""
+    key = str(dll_name or NAME).lower()
+    if key in _SYS_MD5_CACHE:
+        return _SYS_MD5_CACHE[key]
     try:
-        _SYS_MD5 = _md5(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", NAME))
+        val = _md5(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", dll_name))
     except Exception:
-        _SYS_MD5 = ""
-    return _SYS_MD5
+        val = ""
+    _SYS_MD5_CACHE[key] = val
+    return val
 
 
-_SYS_MD5 = None
+def _system_hid_md5():
+    return _system_dll_md5(NAME)
+
+
+def _system_version_md5():
+    return _system_dll_md5(LEGACY_NAME)
 
 
 def _known_hashes(state=None):
@@ -206,21 +232,55 @@ def _try_remove(path):
 
 
 def _clean_extras(d, remove_alts=True, remove_baks=True):
-    """清理未锁定的多余 .ver*.dat 与 version.dll.bak-*，返回 (alts_removed, baks_removed)。"""
+    """清理未锁定的多余 .hid*.dat 与 hid.dll.bak-*（含旧版 version.dll.bak-* / .ver*.dat），返回 (alts_removed, baks_removed)。"""
     alt_n = bak_n = 0
     if remove_alts:
-        for a in _alts(d):
+        for a in _alts(d) + _legacy_alts(d):
             if os.path.isfile(a):
                 ok, _ = _try_remove(a)
                 if ok:
                     alt_n += 1
     if remove_baks:
-        for b in _baks(d):
+        for b in _baks(d) + _legacy_baks(d):
             if os.path.isfile(b):
                 ok, _ = _try_remove(b)
                 if ok:
                     bak_n += 1
     return alt_n, bak_n
+
+
+def _clean_legacy_version_dll(d, hashes=None, only_known=False):
+    """清理非活跃目录中旧版遗留的 version.dll（系统真身不动）。返回是否移除。"""
+    ver = os.path.join(os.fspath(d), LEGACY_NAME)
+    if not os.path.isfile(ver):
+        return False
+    try:
+        cur_md5 = _md5(ver)
+    except OSError:
+        return False
+    sys_md5 = _system_version_md5()
+    if cur_md5 and sys_md5 and cur_md5 == sys_md5:
+        return False
+    if only_known and (not hashes or cur_md5 not in hashes):
+        return False
+    ok, _ = _try_remove(ver)
+    return ok
+
+
+def has_legacy_residuals(d):
+    """检查目录中是否存在旧版 version.dll / .ver*.dat / version.dll.bak-* 残留。"""
+    d = os.fspath(d)
+    if _legacy_alts(d) or _legacy_baks(d):
+        return True
+    ver = os.path.join(d, LEGACY_NAME)
+    if os.path.isfile(ver):
+        try:
+            sys_md5 = _system_version_md5()
+            if not sys_md5 or _md5(ver) != sys_md5:
+                return True
+        except OSError:
+            return True
+    return False
 
 
 def record_existing_deployed(dirs=None):
@@ -259,27 +319,27 @@ def record_existing_deployed(dirs=None):
 
 
 def hide_in_dir(battle_dir: Path) -> tuple[bool, str]:
-    """从外部协同将 battle_dir 中的我方 version.dll 改名为 .ver.dat（冲突试 .ver1.dat~.ver9.dat）。"""
+    """从外部协同将 battle_dir 中的我方 hid.dll 改名为 .hid.dat（冲突试 .hid1.dat~.hid9.dat）。"""
     d = os.fspath(battle_dir)
     cur = os.path.join(d, NAME)
     if not os.path.isfile(cur):
-        # 幂等：目录里本来就没有 version.dll，目标状态已达成
-        return True, "目录中无 version.dll（无需处理）"
+        # 幂等：目录里本来就没有 hid.dll，目标状态已达成
+        return True, "目录中无 %s（无需处理）" % NAME
     try:
         cur_md5 = _md5(cur)
     except OSError as exc:
-        return False, "读取 version.dll 失败: %s" % exc
+        return False, "读取 %s 失败: %s" % (NAME, exc)
     with _STATE_LOCK:
         if cur_md5 not in _known_hashes():
-            # 不是我们部署的版本也照样挪走：战斗端运行期间，exe 旁边任何 version.dll
+            # 不是我们部署的版本也照样挪走：战斗端运行期间，exe 旁边任何非系统 hid.dll
             # 都会让 RuntimeCheatGuard 报「Suspicious proxy DLL exists beside game exe」
             # 并踢出对局（别的工具箱/旧版本残留都会踩这条）。只有 Windows 自己的那份不动。
-            if cur_md5 and cur_md5 == _system_version_md5():
-                return False, "这是系统自带的 version.dll，不动它"
+            if cur_md5 and cur_md5 == _system_hid_md5():
+                return False, "这是系统自带的 %s，不动它" % NAME
             foreign = True
         else:
             foreign = False
-        # 只清 .bak-*（它们同样会被 guard 判可疑），保留已有的 .ver*.dat：
+        # 只清 .bak-*（它们同样会被 guard 判可疑），保留已有的 .hid*.dat：
         # 那是上一局代理自己藏起来的副本，删掉 heal() 就没东西可搬回来。
         _clean_extras(d, remove_alts=False, remove_baks=True)
         last_err = None
@@ -291,18 +351,18 @@ def hide_in_dir(battle_dir: Path) -> tuple[bool, str]:
                 return True, os.path.basename(cand) + ("（非本工具部署的残留）" if foreign else "")
             except FileNotFoundError:
                 if not os.path.isfile(cur):
-                    return False, "version.dll 已不在原位"
+                    return False, "%s 已不在原位" % NAME
             except OSError as exc:
                 last_err = exc
         if last_err is not None:
             return False, "改名失败: %s" % last_err
-        return False, "无可用 .ver*.dat 槽位"
+        return False, "无可用 .hid*.dat 槽位"
 
 
 def cleanup_stale(remove_dll=False, skip_dirs=None):
-    """启动自愈：清理未锁定的 .bak-* 与非活跃目录中的孤立 .ver*.dat；按需清理残留我方 version.dll。"""
+    """启动自愈：清理未锁定的 .bak-* 与非活跃目录中的孤立 .hid*.dat / 旧版 version.dll 残留；按需清理残留我方 hid.dll。"""
     skip_set = {_norm_dir(p) for p in (skip_dirs or ()) if p}
-    counts = {"bak": 0, "alt": 0, "dll": 0}
+    counts = {"bak": 0, "alt": 0, "dll": 0, "legacy": 0}
     with _STATE_LOCK:
         state = _load_state()
         hashes = _known_hashes(state)
@@ -310,7 +370,7 @@ def cleanup_stale(remove_dll=False, skip_dirs=None):
         dirty = False
         for d in battle_dirs():
             is_active = _norm_dir(d) in skip_set
-            for b in _baks(d):
+            for b in _baks(d) + _legacy_baks(d):
                 if os.path.isfile(b):
                     ok, _ = _try_remove(b)
                     if ok:
@@ -322,6 +382,13 @@ def cleanup_stale(remove_dll=False, skip_dirs=None):
                     ok, _ = _try_remove(a)
                     if ok:
                         counts["alt"] += 1
+            for la in _legacy_alts(d):
+                if os.path.isfile(la):
+                    ok, _ = _try_remove(la)
+                    if ok:
+                        counts["legacy"] += 1
+            if _clean_legacy_version_dll(d, hashes=hashes, only_known=False):
+                counts["legacy"] += 1
             if remove_dll:
                 cur = os.path.join(d, NAME)
                 if os.path.isfile(cur):
@@ -400,15 +467,15 @@ def clear_battle_appcompat_shims() -> list[tuple[str, str, str]]:
 
 
 def heal(emit=None, skip_dirs=None):
-    """把被代理自己改名藏起来的 version.dll 补回来（严格跳过 skip_dirs 中的活跃目录）。
+    """把被代理自己改名藏起来的 hid.dll 补回来（严格跳过 skip_dirs 中的活跃目录），并清理旧版 version.dll 残留。
 
-    代理定时器一启动就会把自身文件改名（.ver.dat，占不到就 .ver1.dat …），躲开
+    代理定时器一启动就会把自身文件改名（.hid.dat，占不到就 .hid1.dat …），躲开
     RuntimeCheatGuard 的「exe 旁有可疑 DLL」目录扫描；所以跑过一局之后目录里没有
-    version.dll 了。战斗端彻底退出后调用这里恢复，否则下一局代理不会被加载。返回 (ok, msg)。"""
+    hid.dll 了。战斗端彻底退出后调用这里恢复，否则下一局代理不会被加载。返回 (ok, msg)。"""
     src = dll_source()
     shims_cleared = clear_battle_appcompat_shims()
     if emit and shims_cleared:
-        emit("已清理 Windows 兼容层 Shim %d 条（防止抢先加载 System32\\version.dll）" % len(shims_cleared))
+        emit("已清理 Windows 兼容层 Shim %d 条（防止抢先加载 System32 DLL）" % len(shims_cleared))
     skip_set = {_norm_dir(p) for p in (skip_dirs or ()) if p}
     fixed, kept, stale, locked = 0, 0, 0, 0
     src_md5 = ""
@@ -424,6 +491,8 @@ def heal(emit=None, skip_dirs=None):
         for d in battle_dirs():
             if _norm_dir(d) in skip_set:
                 continue
+            if _clean_legacy_version_dll(d, only_known=False):
+                stale += 1
             cur = os.path.join(d, NAME)
             alts = _alts(d)
             if os.path.isfile(cur):
@@ -479,7 +548,8 @@ def heal(emit=None, skip_dirs=None):
                     fixed += 1
                     installed[d] = {"ts": now, "md5": src_md5}
                     dirty = True
-                    _clean_extras(d, remove_alts=False, remove_baks=True)
+                    alt_n, _bak_n = _clean_extras(d, remove_alts=True, remove_baks=True)
+                    stale += alt_n
                 except Exception as e:
                     if emit:
                         emit("补回代理失败 %s（%s）" % (d, e))
@@ -498,18 +568,23 @@ def heal(emit=None, skip_dirs=None):
     return (fixed + kept) > 0, msg
 
 
-def install(dirs=None, emit=None, all_dirs=True):
-    """把代理复制进 battle 目录。返回 (ok, msg)。"""
+def install(dirs=None, emit=None, all_dirs=True, skip_dirs=None):
+    """把代理复制进 battle 目录（跳过 skip_dirs 中的活跃目录，并清理旧版 version.dll 残留）。返回 (ok, msg)。"""
     src = dll_source()
     if not src:
-        return False, "找不到代理 DLL（risk\\proxy\\version.dll），先跑 risk\\proxy\\build_proxy.py"
+        return False, "找不到代理 DLL（risk\\proxy\\%s），先跑 risk\\proxy\\build_proxy.py" % NAME
     shims_cleared = clear_battle_appcompat_shims()
     if emit and shims_cleared:
-        emit("已清理 Windows 兼容层 Shim %d 条（防止抢先加载 System32\\version.dll）" % len(shims_cleared))
+        emit("已清理 Windows 兼容层 Shim %d 条（防止抢先加载 System32 DLL）" % len(shims_cleared))
 
-    targets = dirs or battle_dirs()
+    targets = list(dirs) if dirs is not None else battle_dirs()
     if not targets:
         return False, "没找到 battle 目录（游戏没装？）"
+    skip_set = {_norm_dir(p) for p in (skip_dirs or ()) if p}
+    if skip_set:
+        targets = [d for d in targets if _norm_dir(d) not in skip_set]
+        if not targets:
+            return True, "活跃战斗端目录正在运行中，暂跳过部署（退出后自动恢复）"
     if not all_dirs and len(targets) > 1:
         # 只装正在跑的那一份；找不到就装第一个
         try:
@@ -528,6 +603,7 @@ def install(dirs=None, emit=None, all_dirs=True):
             dst = os.path.join(d, NAME)
             try:
                 _clean_extras(d, remove_alts=True, remove_baks=True)
+                _clean_legacy_version_dll(d, only_known=False)
                 if os.path.isfile(dst):
                     if _md5(dst) == src_md5:
                         state["installed"][d] = {"ts": time.time(), "md5": src_md5, "skip": True}
@@ -536,7 +612,7 @@ def install(dirs=None, emit=None, all_dirs=True):
                     bak = dst + time.strftime(".bak-%Y%m%d-%H%M%S")
                     shutil.move(dst, bak)
                     if emit:
-                        emit("已有 version.dll，已备份为 %s" % os.path.basename(bak))
+                        emit("已有 %s，已备份为 %s" % (NAME, os.path.basename(bak)))
                 shutil.copy2(src, dst)
                 state["installed"][d] = {"ts": time.time(), "md5": src_md5}
                 done.append(d)
@@ -563,7 +639,7 @@ def install(dirs=None, emit=None, all_dirs=True):
 
 
 def uninstall(emit=None):
-    """移除确认属于本工具的代理，包括运行时改名的 .ver*.dat 与备份 version.dll.bak-*。"""
+    """移除确认属于本工具的代理，包括运行时改名的 .hid*.dat、备份 hid.dll.bak-* 以及旧版 version.dll/.ver*.dat/version.dll.bak-* 残留。"""
     with _STATE_LOCK:
         state = _load_state()
         hashes = _known_hashes(state)
@@ -580,14 +656,24 @@ def uninstall(emit=None):
                     removed.append(f)
                 except OSError as exc:
                     failed.append("%s (%s)" % (f, exc))
-            for bak in _baks(d):
-                if not os.path.isfile(bak):
+            legacy_ver = os.path.join(d, LEGACY_NAME)
+            if os.path.isfile(legacy_ver):
+                try:
+                    if _md5(legacy_ver) in hashes:
+                        os.remove(legacy_ver)
+                        removed.append(legacy_ver)
+                    else:
+                        kept.append(legacy_ver)
+                except OSError as exc:
+                    failed.append("%s (%s)" % (legacy_ver, exc))
+            for lf in _legacy_alts(d) + _baks(d) + _legacy_baks(d):
+                if not os.path.isfile(lf):
                     continue
                 try:
-                    os.remove(bak)
-                    removed.append(bak)
+                    os.remove(lf)
+                    removed.append(lf)
                 except OSError as exc:
-                    failed.append("%s (%s)" % (bak, exc))
+                    failed.append("%s (%s)" % (lf, exc))
         if not failed:
             state["installed"] = {}
         state["ts"] = time.time()
@@ -624,6 +710,7 @@ def status():
         "installed": ds,
         "installed_count": len(ds),
         "battle_dirs": battle_dirs(),
+        "any_hid_dll": any_hid_dll(),
         "any_version_dll": any_version_dll(),
         "payload": payload,
         "built_at": st.get("built_at"),

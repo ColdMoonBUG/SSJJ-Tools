@@ -29,7 +29,8 @@ def data_dir():
             return Path(d["data_root"])
     except Exception:
         pass
-    for cand in (app_dir(), app_dir().parent):
+    cands = (app_dir(),) if getattr(sys, "frozen", False) else (app_dir(), app_dir().parent)
+    for cand in cands:
         if (cand / "lobby_res_cache").is_dir():
             return cand
     # 免安装分发：exe 放在只读位置（U 盘只读、Program Files、压缩包内直接双击）时，

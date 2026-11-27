@@ -1,15 +1,14 @@
 /*
- * version.dll 代理（x64，无 CRT，纯 Win32）
+ * hid.dll 代理（x64，无 CRT，纯 Win32）
  *
  * 目的：把换肤载荷从「跨进程 CreateRemoteThread」改成「进程内加载」。
- * 原理：SSJJ_BattleClient_Unity.exe 只导入 KERNEL32 + UnityPlayer.dll，
- *       而 UnityPlayer.dll 的导入表里有 VERSION.dll，且 version.dll 不在
- *       KnownDLLs 里 —— 所以放在 battle\*_64\ 的同名 DLL 会被优先加载。
+ * 原理：UnityPlayer.dll 会加载同目录下的 hid.dll（不在 KnownDLLs 里，
+ *       不被 UnityCrashHandler64.exe 导入，也不被 AppCompatFlags 抢占）。
  *       我们的代码从 DllMain 起就在进程内、跑在真实模块里，
  *       不经过 OpenProcess / VirtualAllocEx / CreateRemoteThread，
  *       GameGuard 对「外部线程执行匿名页」的拦截不会触发。
  *
- * 导出：version.dll 全部 17 个导出原样转发到 C:\Windows\System32\version.dll。
+ * 导出：hid.dll 全部 44 个导出原样转发到 C:\Windows\System32\hid.dll。
  * 载荷：risk/payload/bin/System.Configuration.Install.dll 以字节数组编进来，
  *       工作线程等 mono-2.0-bdwgc.dll 出现后调用 SsjjRisk.Loader.Load()。
  *
@@ -179,7 +178,7 @@ static void a2w(const char *src, u16 *dst, int cap)
     dst[i] = 0;
 }
 
-/* 把本模块在 LDR 条目里的完整路径就地改写成系统 version.dll 的路径。
+/* 把本模块在 LDR 条目里的完整路径就地改写成系统 hid.dll 的路径。
    游戏自带 RuntimeCheatGuard 判定「进程里有没有可疑代理」的做法是：拿到某个模块
    再取它的路径，看是不是在 System32 之外。路径一改，它就认为这是系统那份。
    只改字符串内容（原缓冲容量够大，系统路径更短），不动链表、不动文件句柄，
@@ -197,7 +196,7 @@ static int spoof_names(HMODULE self)
     while (cur && cur != head && guard++ < 4096) {
         LDR_ENTRY *e = (LDR_ENTRY *)cur;
         if (e->DllBase == (void *)self) {
-            const char *fake = "C:\\Windows\\System32\\version.dll";
+            const char *fake = "C:\\Windows\\System32\\hid.dll";
             int L = (int)slen(fake);
             if (!e->FullDllName.Buffer) return -1;
             if ((int)e->FullDllName.MaxLength < (L + 1) * 2) return -2;
@@ -270,16 +269,16 @@ static void plog2(const char *a, const char *b)
     plog(buf);
 }
 
-/* ---------------- version.dll 转发 ---------------- */
+/* ---------------- hid.dll 转发（44 个导出） ---------------- */
 
 static HMODULE g_sys;
-static char g_sys_path[] = "C:\\Windows\\System32\\version.dll";
+static char g_sys_path[] = "C:\\Windows\\System32\\hid.dll";
 
 static HMODULE g_self;
 static u16 g_real_path[520];   /* DllMain 里抢在路径伪装之前存下来的真实路径 */
 static int g_spoof;            /* 路径伪装结果：1/0/-1/-2 */
 static int g_cloak_boot;       /* DllMain 摘链结果 */
-static HMODULE g_sys_pinned;   /* DllMain 里先钉住的系统 version.dll，防止伪装后被当成本模块 */
+static HMODULE g_sys_pinned;   /* DllMain 里先钉住的系统 hid.dll，防止伪装后被当成本模块 */
 
 static void *sysfn(const char *name)
 {
@@ -297,121 +296,69 @@ static void *sysfn(const char *name)
     return GetProcAddress(g_sys, name);
 }
 
-typedef ibool(__stdcall *fn_vqw)(const void *, const u16 *, void **, u32 *);
-typedef ibool(__stdcall *fn_gfviw)(const u16 *, u32, u32, void *);
-typedef u32(__stdcall *fn_gfvisw)(const u16 *, u32 *);
-typedef u32(__stdcall *fn_verb)(const void *, const u16 *, void **, u32 *);
+typedef u64(__stdcall *fn_hid8)(u64, u64, u64, u64, u64, u64, u64, u64);
 
-__declspec(dllexport) ibool __stdcall VerQueryValueW(const void *block, const u16 *sub, void **buf, u32 *len)
-{
-    fn_vqw p = (fn_vqw)sysfn("VerQueryValueW");
-    return p ? p(block, sub, buf, len) : 0;
+#define HID_FWD(name) \
+__declspec(dllexport) u64 __stdcall name(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7, u64 a8) \
+{ \
+    fn_hid8 p = (fn_hid8)sysfn(#name); \
+    return p ? p(a1, a2, a3, a4, a5, a6, a7, a8) : 0; \
 }
-__declspec(dllexport) ibool __stdcall VerQueryValueA(const void *block, const char *sub, void **buf, u32 *len)
-{
-    fn_vqw p = (fn_vqw)sysfn("VerQueryValueA");
-    return p ? p(block, (const u16 *)sub, buf, len) : 0;
-}
-__declspec(dllexport) ibool __stdcall GetFileVersionInfoW(const u16 *f, u32 hs, u32 len, void *data)
-{
-    fn_gfviw p = (fn_gfviw)sysfn("GetFileVersionInfoW");
-    return p ? p(f, hs, len, data) : 0;
-}
-__declspec(dllexport) ibool __stdcall GetFileVersionInfoA(const char *f, u32 hs, u32 len, void *data)
-{
-    fn_gfviw p = (fn_gfviw)sysfn("GetFileVersionInfoA");
-    return p ? p((const u16 *)f, hs, len, data) : 0;
-}
-__declspec(dllexport) ibool __stdcall GetFileVersionInfoExW(u32 flags, const u16 *f, u32 hs, u32 len, void *data)
-{
-    typedef ibool(__stdcall *fn)(u32, const u16 *, u32, u32, void *);
-    fn p = (fn)sysfn("GetFileVersionInfoExW");
-    return p ? p(flags, f, hs, len, data) : 0;
-}
-__declspec(dllexport) ibool __stdcall GetFileVersionInfoExA(u32 flags, const char *f, u32 hs, u32 len, void *data)
-{
-    typedef ibool(__stdcall *fn)(u32, const char *, u32, u32, void *);
-    fn p = (fn)sysfn("GetFileVersionInfoExA");
-    return p ? p(flags, f, hs, len, data) : 0;
-}
-__declspec(dllexport) u32 __stdcall GetFileVersionInfoSizeW(const u16 *f, u32 *handle)
-{
-    fn_gfvisw p = (fn_gfvisw)sysfn("GetFileVersionInfoSizeW");
-    return p ? p(f, handle) : 0;
-}
-__declspec(dllexport) u32 __stdcall GetFileVersionInfoSizeA(const char *f, u32 *handle)
-{
-    fn_gfvisw p = (fn_gfvisw)sysfn("GetFileVersionInfoSizeA");
-    return p ? p((const u16 *)f, handle) : 0;
-}
-__declspec(dllexport) u32 __stdcall GetFileVersionInfoSizeExW(u32 flags, const u16 *f, u32 *handle)
-{
-    typedef u32(__stdcall *fn)(u32, const u16 *, u32 *);
-    fn p = (fn)sysfn("GetFileVersionInfoSizeExW");
-    return p ? p(flags, f, handle) : 0;
-}
-__declspec(dllexport) u32 __stdcall GetFileVersionInfoSizeExA(u32 flags, const char *f, u32 *handle)
-{
-    typedef u32(__stdcall *fn)(u32, const char *, u32 *);
-    fn p = (fn)sysfn("GetFileVersionInfoSizeExA");
-    return p ? p(flags, f, handle) : 0;
-}
-__declspec(dllexport) ibool __stdcall GetFileVersionInfoByHandle(u32 flags, HANDLE h, u32 len, void *data)
-{
-    typedef ibool(__stdcall *fn)(u32, HANDLE, u32, void *);
-    fn p = (fn)sysfn("GetFileVersionInfoByHandle");
-    return p ? p(flags, h, len, data) : 0;
-}
-__declspec(dllexport) u32 __stdcall VerFindFileA(u32 flags, const char *file, const char *winDir, const char *appDir,
-                                                char *curDir, u32 *curLen, char *destDir, u32 *destLen)
-{
-    typedef u32(__stdcall *fn)(u32, const char *, const char *, const char *, char *, u32 *, char *, u32 *);
-    fn p = (fn)sysfn("VerFindFileA");
-    return p ? p(flags, file, winDir, appDir, curDir, curLen, destDir, destLen) : 0;
-}
-__declspec(dllexport) u32 __stdcall VerFindFileW(u32 flags, const u16 *file, const u16 *winDir, const u16 *appDir,
-                                                u16 *curDir, u32 *curLen, u16 *destDir, u32 *destLen)
-{
-    typedef u32(__stdcall *fn)(u32, const u16 *, const u16 *, const u16 *, u16 *, u32 *, u16 *, u32 *);
-    fn p = (fn)sysfn("VerFindFileW");
-    return p ? p(flags, file, winDir, appDir, curDir, curLen, destDir, destLen) : 0;
-}
-__declspec(dllexport) u32 __stdcall VerInstallFileA(u32 flags, const char *src, const char *dest, const char *srcDir,
-                                                   const char *destDir, char *tmp, u32 *tmpLen)
-{
-    typedef u32(__stdcall *fn)(u32, const char *, const char *, const char *, const char *, char *, u32 *);
-    fn p = (fn)sysfn("VerInstallFileA");
-    return p ? p(flags, src, dest, srcDir, destDir, tmp, tmpLen) : 0;
-}
-__declspec(dllexport) u32 __stdcall VerInstallFileW(u32 flags, const u16 *src, const u16 *dest, const u16 *srcDir,
-                                                   const u16 *destDir, u16 *tmp, u32 *tmpLen)
-{
-    typedef u32(__stdcall *fn)(u32, const u16 *, const u16 *, const u16 *, const u16 *, u16 *, u32 *);
-    fn p = (fn)sysfn("VerInstallFileW");
-    return p ? p(flags, src, dest, srcDir, destDir, tmp, tmpLen) : 0;
-}
-__declspec(dllexport) u32 __stdcall VerLanguageNameA(u32 lang, char *buf, u32 len)
-{
-    typedef u32(__stdcall *fn)(u32, char *, u32);
-    fn p = (fn)sysfn("VerLanguageNameA");
-    return p ? p(lang, buf, len) : 0;
-}
-__declspec(dllexport) u32 __stdcall VerLanguageNameW(u32 lang, u16 *buf, u32 len)
-{
-    typedef u32(__stdcall *fn)(u32, u16 *, u32);
-    fn p = (fn)sysfn("VerLanguageNameW");
-    return p ? p(lang, buf, len) : 0;
-}
+
+HID_FWD(HidD_FlushQueue)
+HID_FWD(HidD_FreePreparsedData)
+HID_FWD(HidD_GetAttributes)
+HID_FWD(HidD_GetConfiguration)
+HID_FWD(HidD_GetFeature)
+HID_FWD(HidD_GetHidGuid)
+HID_FWD(HidD_GetIndexedString)
+HID_FWD(HidD_GetInputReport)
+HID_FWD(HidD_GetManufacturerString)
+HID_FWD(HidD_GetMsGenreDescriptor)
+HID_FWD(HidD_GetNumInputBuffers)
+HID_FWD(HidD_GetPhysicalDescriptor)
+HID_FWD(HidD_GetPreparsedData)
+HID_FWD(HidD_GetProductString)
+HID_FWD(HidD_GetSerialNumberString)
+HID_FWD(HidD_Hello)
+HID_FWD(HidD_SetConfiguration)
+HID_FWD(HidD_SetFeature)
+HID_FWD(HidD_SetNumInputBuffers)
+HID_FWD(HidD_SetOutputReport)
+HID_FWD(HidP_GetButtonCaps)
+HID_FWD(HidP_GetCaps)
+HID_FWD(HidP_GetData)
+HID_FWD(HidP_GetExtendedAttributes)
+HID_FWD(HidP_GetLinkCollectionNodes)
+HID_FWD(HidP_GetScaledUsageValue)
+HID_FWD(HidP_GetSpecificButtonCaps)
+HID_FWD(HidP_GetSpecificValueCaps)
+HID_FWD(HidP_GetUsageValue)
+HID_FWD(HidP_GetUsageValueArray)
+HID_FWD(HidP_GetUsages)
+HID_FWD(HidP_GetUsagesEx)
+HID_FWD(HidP_GetValueCaps)
+HID_FWD(HidP_InitializeReportForID)
+HID_FWD(HidP_MaxDataListLength)
+HID_FWD(HidP_MaxUsageListLength)
+HID_FWD(HidP_SetData)
+HID_FWD(HidP_SetScaledUsageValue)
+HID_FWD(HidP_SetUsageValue)
+HID_FWD(HidP_SetUsageValueArray)
+HID_FWD(HidP_SetUsages)
+HID_FWD(HidP_TranslateUsagesToI8042ScanCodes)
+HID_FWD(HidP_UnsetUsages)
+HID_FWD(HidP_UsageListDifference)
 
 /* ---------------- mono 调用 ---------------- */
 
-/* 把本 DLL 的文件名从 version.dll 改成 .ver.dat（同目录）。
+/* 把本 DLL 的文件名从 hid.dll 改成 .hid.dat（同目录）。
    GetModuleFileNameW(self) 给出的是这一份的完整路径，改完游戏目录里就没有
-   「exe 旁边多出来的 version.dll」这个特征了。失败不影响运行，只记一行日志。 */
+   「exe 旁边多出来的 hid.dll」这个特征了。失败不影响运行，只记一行日志。 */
 static int hide_self(HMODULE self)
 {
     /* 返回：1=本次改名成功；0=已经被别的进程改过（错误码 2）；<0 = 失败（绝对值带 GetLastError） */
-    /* 注意：不能用 GetModuleFileNameW —— DllMain 里已把 LDR 里的路径伪装成系统 version.dll，
+    /* 注意：不能用 GetModuleFileNameW —— DllMain 里已把 LDR 里的路径伪装成系统 hid.dll，
        那个 API 读的就是这条路径，会去改名 System32 下的文件（必然失败）。用 g_real_path。 */
     u16 path[520];
     u32 n = 0;
@@ -426,7 +373,7 @@ static int hide_self(HMODULE self)
     for (k = 0; k < (int)n; k++) if (path[k] == '\\') cut = k;
     if (cut < 0) return -2;
 
-    /* 先清理历史槽位：残留的 .ver.dat / .ver1~9.dat 会把 10 个名字占满，
+    /* 先清理历史槽位：残留的 .hid.dat / .hid1~9.dat 会把 10 个名字占满，
        导致这次改名直接 -1999（其它机器上就是「过检测失效、之后一直进不去」的成因之一）。
        删不掉的（还被上一局进程映射着）跳过即可，DeleteFileW 失败不影响后面。 */
     {
@@ -435,7 +382,7 @@ static int hide_self(HMODULE self)
             u16 tmp[520];
             int kk;
             for (kk = 0; kk <= cut; kk++) tmp[kk] = path[kk];
-            const char *p2 = ".ver";
+            const char *p2 = ".hid";
             int t2 = 0;
             while (p2[t2]) { tmp[cut + 1 + t2] = (u16)(unsigned char)p2[t2]; t2++; }
             if (ci > 0) tmp[cut + 1 + t2++] = (u16)('0' + ci);
@@ -447,14 +394,14 @@ static int hide_self(HMODULE self)
         }
     }
 
-    /* 依次尝试 .ver.dat / .ver1.dat ... .ver9.dat：上一局留下的 .ver.dat 可能被别的进程
+    /* 依次尝试 .hid.dat / .hid1.dat ... .hid9.dat：上一局留下的 .hid.dat 可能被别的进程
        锁着（实测 MoveFileEx REPLACE_EXISTING 也报 1005 Access denied），换个名字绕开。 */
     int idx;
     for (idx = 0; idx < 10; idx++)
     {
         u16 dst[520];
         for (k = 0; k <= cut; k++) dst[k] = path[k];
-        const char *pre = ".ver";
+        const char *pre = ".hid";
         int t = 0;
         while (pre[t]) { dst[cut + 1 + t] = (u16)(unsigned char)pre[t]; t++; }
         if (idx > 0) dst[cut + 1 + t++] = (u16)('0' + idx);
@@ -475,6 +422,7 @@ static int hide_self(HMODULE self)
 
 typedef void *(*fn_root)(void);
 typedef void *(*fn_attach)(void *);
+typedef void (*fn_detach)(void *);
 typedef void *(*fn_open)(char *, u32, int, int *, int, const char *);
 typedef void *(*fn_loadfull)(void *, const char *, int *, int);
 typedef void *(*fn_class)(void *, const char *, const char *);
@@ -486,6 +434,7 @@ static void run_payload(HMODULE mono)
 {
     fn_root p_root = (fn_root)GetProcAddress(mono, "mono_get_root_domain");
     fn_attach p_attach = (fn_attach)GetProcAddress(mono, "mono_thread_attach");
+    fn_detach p_detach = (fn_detach)GetProcAddress(mono, "mono_thread_detach");
     fn_open p_open = (fn_open)GetProcAddress(mono, "mono_image_open_from_data_with_name");
     fn_loadfull p_load = (fn_loadfull)GetProcAddress(mono, "mono_assembly_load_from_full");
     fn_class p_class = (fn_class)GetProcAddress(mono, "mono_class_from_name");
@@ -499,27 +448,44 @@ static void run_payload(HMODULE mono)
 
     void *domain = p_root();
     if (!domain) { plog("[proxy] root domain 为空"); return; }
-    p_attach(domain);
+    void *mthread = p_attach(domain);
 
     int status = 0;
     void *image = p_open((char *)payload_dll, payload_dll_len, 1, &status, 0, PAYLOAD_NAME);
-    if (!image) { plog("[proxy] mono_image_open 失败"); return; }
+    if (!image) {
+        plog("[proxy] mono_image_open 失败");
+        if (p_detach && mthread) p_detach(mthread);
+        return;
+    }
 
     status = 0;
     void *asm_ = p_load(image, PAYLOAD_NAME, &status, 0);
-    if (!asm_) { plog("[proxy] mono_assembly_load_from_full 失败"); return; }
+    if (!asm_) {
+        plog("[proxy] mono_assembly_load_from_full 失败");
+        if (p_detach && mthread) p_detach(mthread);
+        return;
+    }
 
     void *klass = p_class(image, "SsjjRisk", "Loader");
-    if (!klass) { plog("[proxy] 找不到 SsjjRisk.Loader"); return; }
+    if (!klass) {
+        plog("[proxy] 找不到 SsjjRisk.Loader");
+        if (p_detach && mthread) p_detach(mthread);
+        return;
+    }
 
     void *method = p_method(klass, "Load", 0);
-    if (!method) { plog("[proxy] 找不到 Loader.Load()"); return; }
+    if (!method) {
+        plog("[proxy] 找不到 Loader.Load()");
+        if (p_detach && mthread) p_detach(mthread);
+        return;
+    }
 
     plog("[proxy] 调用 SsjjRisk.Loader.Load()");
     void *exc = 0;
     p_invoke(method, 0, 0, &exc);
     if (exc) plog("[proxy] Loader.Load 抛异常（详见 risk_inject.log）");
     else plog("[proxy] Loader.Load 返回");
+    if (p_detach && mthread) p_detach(mthread);
 }
 
 /* ---------------- 定时器驱动（不创建任何线程） ----------------
@@ -562,34 +528,35 @@ static void __stdcall on_timer(void *wnd, u32 msg, u64 id, u32 tick)
           正常情况下第 1~2 次就能改掉；杀软刚扫过新拷进来的 DLL 时会占几百毫秒，靠重试兜住。 */
     if (!g_renamed && g_step <= 80) {
         int hr = hide_self(g_self);
-        if (hr == 1) { g_renamed = 1; open_log(); plog("[proxy] 已把自身文件改名为 .ver.dat（躲开目录扫描）"); }
-        else if (hr == 0) { g_renamed = 1; open_log(); plog("[proxy] 自身文件已是 .ver.dat（别的进程改的）"); }
+        if (hr == 1) { g_renamed = 1; open_log(); plog("[proxy] 已把自身文件改名为 .hid.dat（躲开目录扫描）"); }
+        else if (hr == 0) { g_renamed = 1; open_log(); plog("[proxy] 自身文件已是 .hid.dat（别的进程改的）"); }
         else {
             if (g_step <= 3 || g_step % 20 == 0) { open_log(); plog_n("[proxy] 改名失败 hr=", (u32)(-hr)); }
-            if (g_step == 80) { open_log(); plog("[proxy] 自身文件改名始终失败（目录里仍是 version.dll）"); }
+            if (g_step == 80) { open_log(); plog("[proxy] 自身文件改名始终失败（目录里仍是 hid.dll）"); }
         }
     }
 
-    /* 2) 摘 PEB 链：等加载器把初始化走完再做（大约在 100ms 之后），否则会打断 LdrpInitializeThread */
+    /* 2) 保留 PEB LDR 链完整（仅在 DllMain 用 spoof_names 伪装为 System32\hid.dll）：
+          摘除全 PEB 链会导致 x64 RtlLookupFunctionEntry / RtlRaiseException 在
+          npggNT64.des 在场时发生 0xc0000005 (ntdll+0x512ee) 访问冲突。 */
     if (g_step == 1) {
         open_log();
         plog("[proxy] 定时器回调已进入（没有创建线程）");
         plog_n("[proxy] DllMain 路径伪装=", (u32)(g_spoof < 0 ? 90 : g_spoof));
         plog_n("[proxy] DllMain 摘链条数=", (u32)g_cloak_boot);
-        plog_n("[proxy] 系统 version.dll 句柄=", (u32)(g_sys_pinned != 0));
-        unlink_init_chain();
+        plog_n("[proxy] 系统 hid.dll 句柄=", (u32)(g_sys_pinned != 0));
     }
 
-    /* 3) 等 mono 起来，把载荷灌进去 */
+    /* 3) 等 mono 起来并稳定 350ms 后再把载荷灌进去 */
     HMODULE mono = GetModuleHandleA("mono-2.0-bdwgc.dll");
     if (!mono) {
         if (g_step > 2400) { open_log(); plog("[proxy] 等不到 mono-2.0-bdwgc.dll，放弃"); stop_timer(); }
         return;
     }
-    if (g_step < 1) return;
+    if (g_step < 14) return;
     if (_InterlockedCompareExchange(&g_done, 1, 0) != 0) { stop_timer(); return; }
     open_log();
-    plog("[proxy] mono 模块已就位");
+    plog("[proxy] mono 模块已就位（定时器路径）");
     stop_timer();
     run_payload(mono);
 }
@@ -597,7 +564,8 @@ static void __stdcall on_timer(void *wnd, u32 msg, u64 id, u32 tick)
 /* SetTimer 拿不到时的兜底（会创建线程，只在上面的路走不通时用） */
 /* 兜底线程：始终创建。实测有机器在 -window-mode exclusive 下主线程跑了近 3 秒
    也没派发过一次 WM_TIMER，只靠定时器会「改名没做、载荷没加载、proxy.log 0 行」。
-   这里只做三件事：抢改名、补摘第 3 条链、等 mono 后灌载荷（与定时器路径用 g_done 原子互斥）。 */
+   这里只做两件事：抢改名、等 mono root_domain 就绪并稳定 20ms 后灌载荷
+   （保持 PEB 链完整，与定时器路径用 g_done 原子互斥）。 */
 static u32 __stdcall worker(void *arg)
 {
     (void)arg;
@@ -606,18 +574,17 @@ static u32 __stdcall worker(void *arg)
     int i;
     for (i = 0; i < 200 && !g_renamed; i++) {
         int hr = hide_self(g_self);
-        if (hr == 1) { g_renamed = 1; plog("[proxy] 已把自身文件改名为 .ver.dat（线程路径）"); break; }
-        if (hr == 0) { g_renamed = 1; plog("[proxy] 自身文件已是 .ver.dat（别的进程改的）"); break; }
+        if (hr == 1) { g_renamed = 1; plog("[proxy] 已把自身文件改名为 .hid.dat（线程路径）"); break; }
+        if (hr == 0) { g_renamed = 1; plog("[proxy] 自身文件已是 .hid.dat（别的进程改的）"); break; }
         Sleep(25);
     }
-    if (!g_renamed) plog("[proxy] 线程路径改名未成功（目录里可能仍是 version.dll）");
-    unlink_init_chain();
+    if (!g_renamed) plog("[proxy] 线程路径改名未成功（目录里可能仍是 hid.dll）");
     for (i = 0; i < 2400; i++) {
         if (g_done) return 0;
         HMODULE mono = GetModuleHandleA("mono-2.0-bdwgc.dll");
         if (mono) {
-            /* 等待 Mono 完成 root_domain 初始化：避免在刚映射进进程时立刻调 mono_thread_attach 触发 0xc0000409，
-               同时以 10ms 高频轮询且不做额外延迟，一旦 root_domain 非空立即抢在 npggNT64.des 激活前注入。 */
+            /* 等待 Mono 完成 root_domain 初始化，并短暂等待 20ms 让 root_domain 稳定，
+               同时尽量抢在 npggNT64.des 激活之前完成 mono_runtime_invoke。 */
             fn_root p_root = (fn_root)GetProcAddress(mono, "mono_get_root_domain");
             if (!p_root) {
                 plog("[proxy] 找不到 mono_get_root_domain（线程路径），放弃");
@@ -635,8 +602,12 @@ static u32 __stdcall worker(void *arg)
                 plog("[proxy] 等待 mono root_domain 超时（线程路径），放弃");
                 return 0;
             }
+            for (j = 0; j < 2; j++) {
+                if (g_done) return 0;
+                Sleep(10);
+            }
             if (_InterlockedCompareExchange(&g_done, 1, 0) == 0) {
-                plog("[proxy] mono root_domain 已就位，立即执行注入（线程路径）");
+                plog("[proxy] mono root_domain 已稳定就位，立即执行注入（线程路径）");
                 run_payload(mono);
             }
             return 0;
@@ -729,9 +700,9 @@ ibool __stdcall DllMain(HANDLE mod, u32 reason, void *reserved)
             log_attach(GetCurrentProcessId(), is_battle, host[0] ? host : "?");
         }
         if (!is_battle) {
-            /* 非战斗端进程（如 UnityCrashHandler64.exe）：仅加载系统 version.dll 做纯 API 转发透传，
+            /* 非战斗端进程（如 UnityCrashHandler64.exe）：仅加载系统 hid.dll 做纯 API 转发透传，
                严禁改名、严禁摘链、严禁挂定时器、严禁起后台线程。 */
-            g_sys_pinned = LoadLibraryA("C:\\Windows\\System32\\version.dll");
+            g_sys_pinned = LoadLibraryA("C:\\Windows\\System32\\hid.dll");
             return 1;
         }
         /* 改名必须赶在游戏自己的自检扫描之前：它在启动 ~90ms 就枚举 exe 旁文件并上报
@@ -748,14 +719,14 @@ ibool __stdcall DllMain(HANDLE mod, u32 reason, void *reserved)
         {
             /* 顺序很关键：
                1) 先取真实路径（伪装之后就取不到了）；
-               2) 再 LoadLibrary 钉住系统 version.dll（伪装之后按路径查会命中自己）；
-               3) 伪装 LDR 里的路径；
-               4) 最后摘 InLoadOrder / InMemoryOrder 链。 */
+               2) 再 LoadLibrary 钉住系统 hid.dll（伪装之后按路径查会命中自己）；
+               3) 伪装 LDR 里的路径为 C:\Windows\System32\hid.dll；
+               4) 保留 PEB LDR 链完整，避免 x64 异常展开表 / RtlRaiseException 在 npggNT64.des 下访问冲突。 */
             u32 rn = GetModuleFileNameW((HMODULE)mod, g_real_path, 520);
             if (rn == 0 || rn >= 520) g_real_path[0] = 0;
-            g_sys_pinned = LoadLibraryA("C:\\Windows\\System32\\version.dll");
+            g_sys_pinned = LoadLibraryA("C:\\Windows\\System32\\hid.dll");
             g_spoof = spoof_names((HMODULE)mod);
-            g_cloak_boot = cloak_module((HMODULE)mod, 0);
+            g_cloak_boot = 0;
         }
         /* DllMain 里就把第一行写进日志：以前的版本一旦定时器没派发，proxy.log 就是 0 行，
            现场只能看到「游戏自己退出」，根本没法判断是改名失败还是根本没进来。 */

@@ -27,7 +27,7 @@ from . import config, injector
 
 POLL_INTERVAL = 1.5
 FAST_POLL_INTERVAL = 0.15
-EXTERNAL_HIDE_FALLBACK_AGE = 1.2   # 仅当模块快照不可用时，至少等 1.2s 才兜底外部隐藏，避免抢在 VBS/慢启动加载 version.dll 之前
+EXTERNAL_HIDE_FALLBACK_AGE = 1.2   # 仅当模块快照不可用时，至少等 1.2s 才兜底外部隐藏，避免抢在 VBS/慢启动加载 hid.dll 之前
 WAIT_MONO = 90.0
 LOG_PATH = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
                         "ssjj-toolbox", "risk_mode.log")
@@ -417,8 +417,8 @@ def _has_unity_or_mono_loaded(pid):
     """只读检查目标 pid 是否已加载 UnityPlayer.dll 或 mono-2.0-bdwgc.dll。
 
     返回：
-        True  — 已加载（战斗端已完成 version.dll 映射，可安全执行外部兜底隐藏）
-        False — 尚未加载（绝不能提前挪走 version.dll）
+        True  — 已加载（战斗端已完成 hid.dll 映射，可安全执行外部兜底隐藏）
+        False — 尚未加载（绝不能提前挪走 hid.dll）
         None  — 权限/系统原因无法枚举模块
     """
     global _SNAP_K32
@@ -510,7 +510,9 @@ def _probe_battle_process(pid):
                         mod_path = (me.szExePath or "").strip()
                         path_low = mod_path.lower()
                         base_addr = ctypes.cast(me.modBaseAddr, ctypes.c_void_p).value or 0
-                        if mod_low == "version.dll" or (mod_low.startswith(".ver") and mod_low.endswith(".dat")):
+                        if mod_low in ("hid.dll", "version.dll") or (
+                            mod_low.startswith((".hid", ".ver")) and mod_low.endswith(".dat")
+                        ):
                             version_hits.append("%s @0x%X (%dB)" % (mod_path or mod_name, base_addr, int(me.modBaseSize)))
                         if mod_low == "unityplayer.dll":
                             unity_path = mod_path or mod_name
@@ -573,7 +575,7 @@ def _probe_battle_process(pid):
     redir_str = ("0x%X" % redir_v) if isinstance(redir_v, int) else str(redir_v)
 
     ver_summary = "; ".join(version_hits) if version_hits else ("NOT_LOADED" if snap_err is None else "SNAP_ERR(%s)" % snap_err)
-    lines.append("[proxy-probe] pid=%d exe=%s version=%s" % (pid, exe_path, ver_summary))
+    lines.append("[proxy-probe] pid=%d exe=%s proxy=%s" % (pid, exe_path, ver_summary))
     lines.append("[proxy-probe] pid=%d unity=%s mono=%s" % (pid, unity_path, mono_path))
     lines.append("[proxy-probe] pid=%d image_load=%s sig_policy=%s dyn_code=%s redir_trust=%s"
                  % (pid, img_str, sig_str, dyn_str, redir_str))
@@ -590,7 +592,7 @@ def _clear_appcompat_shims(_proxy):
         removed = []
     if removed:
         desc = "; ".join("%s:%s=%s" % (h, k, v) for h, k, v in removed)
-        log("[proxy] 已清理 Windows 兼容层 Shim (防止抢先加载 System32\\version.dll): %s" % desc)
+        log("[proxy] 已清理 Windows 兼容层 Shim (防止抢先加载 System32 DLL): %s" % desc)
     return removed
 
 
@@ -599,7 +601,7 @@ def _watch():
     from . import proxy as _proxy
     mode = _effective_method()
     if mode == "proxy":
-        log("注入守护启动（代理模式），目标 %s：载荷由 battle\\*_64\\version.dll 在战斗端启动时自加载" % target)
+        log("注入守护启动（代理模式），目标 %s：载荷由 battle\\*_64\\%s 在战斗端启动时自加载" % (target, _proxy.NAME))
         _clear_appcompat_shims(_proxy)
     else:
         log("注入守护启动（远程线程模式），目标 %s" % target)
@@ -648,16 +650,16 @@ def _watch():
                         if loaded is True:
                             ok_h, detail_h = _proxy.hide_in_dir(bdir)
                             if ok_h:
-                                log("[proxy] pid=%d UnityPlayer/mono 已就绪仍见 version.dll，外部协同隐藏 -> %s"
-                                    % (pid, detail_h))
+                                log("[proxy] pid=%d UnityPlayer/mono 已就绪仍见 %s，外部协同隐藏 -> %s"
+                                    % (pid, _proxy.NAME, detail_h))
                             elif pid not in hide_warned and "目录中无" not in detail_h and "不在原位" not in detail_h:
                                 hide_warned.add(pid)
                                 log("[proxy] pid=%d 外部协同隐藏失败（%s）: %s" % (pid, os.path.basename(bdir), detail_h))
                         elif loaded is False:
                             if pid not in hide_deferred:
                                 hide_deferred.add(pid)
-                                log("[proxy] pid=%d 等待 UnityPlayer/mono 加载，暂缓外部隐藏（避免抢在游戏加载 version.dll 前）"
-                                    % pid)
+                                log("[proxy] pid=%d 等待 UnityPlayer/mono 加载，暂缓外部隐藏（避免抢在游戏加载 %s 前）"
+                                    % (pid, _proxy.NAME))
                         else:
                             age, age_src = _process_age_seconds(pid, first_seen)
                             if age < EXTERNAL_HIDE_FALLBACK_AGE:
@@ -668,14 +670,14 @@ def _watch():
                             else:
                                 ok_h, detail_h = _proxy.hide_in_dir(bdir)
                                 if ok_h:
-                                    log("[proxy] pid=%d 模块枚举不可用但存活 %.2fs(%s) 仍见 version.dll，兜底外部隐藏 -> %s"
-                                        % (pid, age, age_src, detail_h))
+                                    log("[proxy] pid=%d 模块枚举不可用但存活 %.2fs(%s) 仍见 %s，兜底外部隐藏 -> %s"
+                                        % (pid, age, age_src, _proxy.NAME, detail_h))
                                 elif pid not in hide_warned and "目录中无" not in detail_h and "不在原位" not in detail_h:
                                     hide_warned.add(pid)
                                     log("[proxy] pid=%d 外部协同隐藏失败（%s）: %s" % (pid, os.path.basename(bdir), detail_h))
                     if pid not in _done_pids:
                         _done_pids.add(pid)
-                        log("[proxy] pid=%d 战斗端已启动，载荷由 version.dll 代理加载（不做跨进程注入）" % pid)
+                        log("[proxy] pid=%d 战斗端已启动，载荷由 %s 代理加载（不做跨进程注入）" % (pid, _proxy.NAME))
                 _done_pids.intersection_update(live_pids)
                 hide_warned.intersection_update(live_pids)
                 hide_deferred.intersection_update(live_pids)
@@ -683,7 +685,7 @@ def _watch():
                 for dead_pid in list(first_seen):
                     if dead_pid not in live_pids:
                         first_seen.pop(dead_pid, None)
-                # 仅对「已无活跃战斗端」的区服目录按 1.5s 节流补回，严禁运行期把活跃目录补回 version.dll。
+                # 仅对「已无活跃战斗端」的区服目录按 1.5s 节流补回，严禁运行期把活跃目录补回 hid.dll。
                 now = time.monotonic()
                 if dirs and (now - last_heal) >= POLL_INTERVAL:
                     last_heal = now
@@ -693,9 +695,13 @@ def _watch():
                         if idle_dirs:
                             try:
                                 deployed_norm = {_norm_dir(d) for d in _proxy.deployed()}
-                                if any(_norm_dir(d) not in deployed_norm for d in idle_dirs):
+                                need_legacy = any(
+                                    hasattr(_proxy, "has_legacy_residuals") and _proxy.has_legacy_residuals(d)
+                                    for d in idle_dirs
+                                )
+                                if need_legacy or any(_norm_dir(d) not in deployed_norm for d in idle_dirs):
                                     ok, msg = _proxy.heal(skip_dirs=active_dirs)
-                                    if ok and "补回 0 个" not in msg and "补回" in msg:
+                                    if ok and ("补回 0 个" not in msg and "补回" in msg or "清掉旧残留" in msg):
                                         log("[proxy] " + msg)
                                         _clear_appcompat_shims(_proxy)
                             except Exception as e:
@@ -854,7 +860,7 @@ def inject_state():
 def inject_start(elevate=False):
     """只启动注入守护，不碰总开关、不碰 MITM、不碰大厅。
 
-    代理模式下会顺手确认 version.dll 已部署（没部署就当场装一次），
+    代理模式下会顺手确认 hid.dll 已部署（仅针对非活跃目录，避免运行期覆盖），
     因为那条路的载荷不靠守护、靠游戏加载器。
 
     返回 (ok, 说明)。非管理员时守护照样起，只是注入那一刻会走
@@ -868,14 +874,20 @@ def inject_start(elevate=False):
         try:
             from . import proxy as _proxy
             _clear_appcompat_shims(_proxy)
-            # 上一局结束时代理会把自己改名成 .ver.dat 躲自检，所以每次开守护都先补回
-            _proxy.heal(emit=log)
-            st = _proxy.status()
-            if not st.get("installed_count"):
-                ok, msg = _proxy.install(emit=log)
-                note = "；" + msg
+            target = (config.get("inject.targets") or [injector.DEFAULT_TARGET])[0] or injector.DEFAULT_TARGET
+            dirs = _proxy.battle_dirs()
+            _ps, active_dirs, _pid_dirs, unknown_pids = _inspect_active_battles(target, dirs=dirs)
+            if unknown_pids:
+                note = "；检测到未定位的战斗端进程，暂跳过代理补回（待定位或退出后自动恢复）"
             else:
-                note = "；代理已部署在 %d 个战斗端目录" % st.get("installed_count", 0)
+                # 上一局结束时代理会把自己改名成 .hid.dat 躲自检，仅对非活跃目录补回
+                _proxy.heal(emit=log, skip_dirs=active_dirs)
+                st = _proxy.status()
+                if not st.get("installed_count"):
+                    ok, msg = _proxy.install(emit=log, skip_dirs=active_dirs)
+                    note = "；" + msg
+                else:
+                    note = "；代理已部署在 %d 个战斗端目录" % st.get("installed_count", 0)
         except Exception as e:
             note = "；代理部署失败：%r" % (e,)
     if not _thread or not _thread.is_alive():

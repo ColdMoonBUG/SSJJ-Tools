@@ -167,6 +167,9 @@ class DiagnosticExportTest(unittest.TestCase):
             b3 = game / "battle" / "3_64"
             b3.mkdir(parents=True)
             (b3 / "SSJJ_BattleClient_Unity.exe").write_bytes(b"unity-exe")
+            (b3 / "hid.dll").write_bytes(src.read_bytes())
+            (b3 / ".hid.dat").write_bytes(src.read_bytes())
+            (b3 / "hid.dll.bak-20261127-100000").write_bytes(b"hid-bak")
             (b3 / "version.dll").write_bytes(src.read_bytes())
             (b3 / ".ver.dat").write_bytes(src.read_bytes())
             (b3 / ".ver1.dat").write_bytes(b"older-alt")
@@ -185,8 +188,12 @@ class DiagnosticExportTest(unittest.TestCase):
             self.assertIn(src_sha, report)
             self.assertIn(src_md5, report)
             self.assertIn("DUAL_CONFLICT", report)
+            self.assertIn("LEGACY_VERSION_RESIDUAL", report)
             self.assertIn("BAK_RESIDUAL", report)
             self.assertIn("MULTI_ALT", report)
+            self.assertIn("hid.dll", report)
+            self.assertIn(".hid.dat", report)
+            self.assertIn("hid.dll.bak-20261127-100000", report)
             self.assertIn(".ver.dat", report)
             self.assertIn(".ver1.dat", report)
             self.assertIn(".ver10.dat", report)
@@ -201,9 +208,11 @@ class DiagnosticExportTest(unittest.TestCase):
             b3.mkdir(parents=True)
             exe_bytes = b"unity-exe-payload"
             player_bytes = b"unity-player-payload"
+            hid_bytes = b"proxy-hid-dll"
             dll_bytes = b"proxy-version-dll"
             (b3 / "SSJJ_BattleClient_Unity.exe").write_bytes(exe_bytes)
             (b3 / "UnityPlayer.dll").write_bytes(player_bytes)
+            (b3 / "hid.dll").write_bytes(hid_bytes)
             (b3 / "version.dll").write_bytes(dll_bytes)
 
             with patch.object(diagnostics, "_game_dir", return_value=game), \
@@ -211,12 +220,14 @@ class DiagnosticExportTest(unittest.TestCase):
                 probe = diagnostics._dll_load_policy_probe()
 
             self.assertIn("KnownDLLs:", probe)
+            self.assertIn("has_hid=", probe)
             self.assertIn("SessionManager:", probe)
             self.assertIn("IFEO(SSJJ_BattleClient_Unity.exe):", probe)
             self.assertIn("AppCompatFlags\\Layers(HKLM):", probe)
             self.assertIn("AppCompatFlags\\Layers(HKCU):", probe)
             self.assertIn(hashlib.sha256(exe_bytes).hexdigest()[:16], probe)
             self.assertIn(hashlib.sha256(player_bytes).hexdigest()[:16], probe)
+            self.assertIn(hashlib.sha256(hid_bytes).hexdigest()[:16], probe)
             self.assertIn(hashlib.sha256(dll_bytes).hexdigest()[:16], probe)
             self.assertIn("motw=none", probe)
 
@@ -231,9 +242,11 @@ class DiagnosticExportTest(unittest.TestCase):
     def test_remove_renamed_proxy_keeps_unknown_file(self):
         with tempfile.TemporaryDirectory() as folder:
             battle = Path(folder)
-            own = battle / ".ver.dat"
+            dll_name = getattr(proxy, "NAME", "hid.dll")
+            alt_name = getattr(proxy, "RENAMED", ".hid.dat")
+            own = battle / alt_name
             own.write_bytes(b"our proxy")
-            unknown = battle / "version.dll"
+            unknown = battle / dll_name
             unknown.write_bytes(b"unknown original")
             known_hash = hashlib.md5(own.read_bytes()).hexdigest()
             state = {"md5": known_hash, "installed": {str(battle): {"md5": known_hash}}}

@@ -97,8 +97,8 @@ def accel_daemon_main():
 
 
 # ---------------------------------------------------------------- 加速服务
-def accel_running():
-    return C._ping()
+def accel_running(timeout=2):
+    return C._ping(timeout=timeout)
 
 
 def accel_stats():
@@ -458,6 +458,44 @@ def fps_off():
 WOODUAN_KEY = r"Software\Wooduan"
 BATTLE_EXE = "SSJJ_BattleClient_Unity.exe"
 
+# GameSetting.xml 的索引：QualityLevel 1/2/4 = 低/中/极高；
+# TextureQuality 0/1/2 = 高/中/低，EffectParticleLevel 0..4 = 极低..极高。
+# “最低”进一步降低贴图、特效和显示距离；不触碰分辨率/帧率/音量。
+GAME_QUALITY_PRESETS = {
+    "极高": {
+        "QualityLevel": 4, "TextureQuality": 0, "EffectParticleLevel": 4,
+        "EffectParticleDistance": 100, "AntiAliasLevel": 3, "PlayerShadow": 3,
+        "OpenSkyboxEffect": 1, "ShowThirdWeapon": 1,
+    },
+    "中等": {
+        "QualityLevel": 2, "TextureQuality": 1, "EffectParticleLevel": 2,
+        "EffectParticleDistance": 50, "AntiAliasLevel": 0, "PlayerShadow": 0,
+        "OpenSkyboxEffect": 1, "ShowThirdWeapon": 1,
+    },
+    "最低": {
+        "QualityLevel": 1, "TextureQuality": 2, "EffectParticleLevel": 0,
+        "EffectParticleDistance": 0, "AntiAliasLevel": 0, "PlayerShadow": 0,
+        "OpenSkyboxEffect": 0, "ShowThirdWeapon": 0,
+    },
+}
+_QUALITY_FIELDS = tuple(GAME_QUALITY_PRESETS["极高"])
+
+
+def _quality_values(key):
+    """只接受现有的、唯一的 REG_DWORD PlayerPrefs 项，不误写 Version 项。"""
+    found = {}
+    for name in _enum_names(key):
+        match = re.fullmatch(r"([A-Za-z]+)_h\d+", name)
+        if match and match.group(1) in _QUALITY_FIELDS:
+            field = match.group(1)
+            if field in found:
+                raise ValueError("重复的游戏设置项：" + field)
+            value, typ = winreg.QueryValueEx(key, name)
+            if typ != winreg.REG_DWORD:
+                raise ValueError("游戏设置项类型不符：" + field)
+            found[field] = (name, value)
+    return found
+
 
 def _enum_names(key):
     names, i = [], 0
@@ -562,6 +600,68 @@ def game_fps_set(limit=None, vsync_off=None):
     if not done:
         return False, "游戏还没生成对应设置项，先启动一次战斗客户端。"
     return True, "已写入游戏设置：" + "，".join(done) + "。启动战斗端后生效。"
+
+
+def game_quality_state():
+    st = {"found": False, "preset": None, "missing": list(_QUALITY_FIELDS),
+          "error": None, "running": battle_running()}
+    subs = _pref_subs()
+    if not subs:
+        return st
+    st["found"] = True
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WOODUAN_KEY + "\\" + subs[0]) as key:
+            values = _quality_values(key)
+    except (OSError, ValueError) as exc:
+        st["error"] = str(exc)
+        return st
+    st["missing"] = [field for field in _QUALITY_FIELDS if field not in values]
+    if not st["missing"]:
+        current = {field: value for field, (_name, value) in values.items()}
+        st["preset"] = next((label for label, preset in GAME_QUALITY_PRESETS.items()
+                             if current == preset), None)
+    return st
+
+
+def game_quality_set(preset):
+    """游戏退出后写入已有画质项；写入失败时尽量恢复原值并明确报错。"""
+    if preset not in GAME_QUALITY_PRESETS:
+        return False, "未知画质档位：" + str(preset)
+    if battle_running():
+        return False, "战斗客户端正在运行：先退出游戏再写，否则退出时会被游戏覆盖。"
+    subs = _pref_subs()
+    if not subs:
+        return False, "没有找到游戏设置项。先启动一次战斗客户端生成设置。"
+    path = WOODUAN_KEY + "\\" + subs[0]
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+            values = _quality_values(key)
+            missing = [field for field in _QUALITY_FIELDS if field not in values]
+            if missing:
+                return False, "缺少画质设置项：" + "、".join(missing) + "。请先在游戏里调整一次画质。"
+            written = []
+            try:
+                for field, value in GAME_QUALITY_PRESETS[preset].items():
+                    name, old = values[field]
+                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+                    written.append((name, old))
+            except OSError as exc:
+                failed = []
+                for name, old in reversed(written):
+                    try:
+                        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, old)
+                    except OSError:
+                        failed.append(name)
+                msg = "写画质设置失败：%s" % exc
+                if failed:
+                    msg += "；以下设置恢复失败：" + "、".join(failed)
+                else:
+                    msg += "；已恢复原值"
+                return False, msg
+    except (OSError, ValueError) as exc:
+        return False, "读取画质设置失败：" + str(exc)
+    return True, "已写入画质：%s。下次启动战斗端生效。" % preset
 
 
 # ---------------------------------------------------------------- 游戏与系统
@@ -871,9 +971,9 @@ def risk_elevate(reinject=False):
     return guard.elevate(reinject=reinject)
 
 
-# --------------------------------------------------- 代理 DLL 模式（version.dll）
+# --------------------------------------------------- 代理 DLL 模式（hid.dll）
 def risk_proxy_state():
-    """version.dll 代理的部署状态。"""
+    """hid.dll 代理的部署状态。"""
     try:
         proxy = _risk_mod('proxy')
         return proxy.status()
@@ -1125,19 +1225,103 @@ def skin_rebuild_catalog():
     return ok, msg
 
 
+def _read_skin_swap_raw(cfg_path):
+    try:
+        if cfg_path.is_file():
+            d = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
 def skin_load_rules():
     import skin_swap as SS
-    return SS.load_rules()
+    res = SS.load_rules()
+    raw = _read_skin_swap_raw(SS.SWAP_CONFIG)
+    res["self_only"] = bool(raw.get("self_only", True))
+    res["killfeed_sim"] = bool(raw.get("killfeed_sim", True))
+    return res
 
 
-def skin_save_rules(data):
+def skin_save_rules(data, allow_empty=False):
     import skin_swap as SS
-    return SS.save_rules(data)
+    raw_prev = _read_skin_swap_raw(SS.SWAP_CONFIG)
+    prev_self_only = bool(raw_prev.get("self_only", True))
+    prev_killfeed_sim = bool(raw_prev.get("killfeed_sim", True))
+    d = data if isinstance(data, dict) else {}
+    self_only = bool(d.get("self_only", prev_self_only))
+    killfeed_sim = bool(d.get("killfeed_sim", prev_killfeed_sim))
+    ok, msg = SS.save_rules(d, allow_empty=allow_empty)
+    if ok:
+        try:
+            saved = _read_skin_swap_raw(SS.SWAP_CONFIG)
+            if not saved:
+                saved = {"enabled": bool(d.get("enabled", True)), "rules": []}
+            saved["self_only"] = self_only
+            saved["killfeed_sim"] = killfeed_sim
+            tmp = str(SS.SWAP_CONFIG) + ".tmp"
+            Path(tmp).write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, str(SS.SWAP_CONFIG))
+        except Exception as e:
+            return False, "写入换肤开关失败：%r" % (e,)
+    return ok, msg
+
+
+def skin_set_options(self_only=None, killfeed_sim=None):
+    """单独读写 skin_swap.json 中的 self_only 与 killfeed_sim 布尔开关。"""
+    import skin_swap as SS
+    SS.SWAP_DIR.mkdir(parents=True, exist_ok=True)
+    saved = _read_skin_swap_raw(SS.SWAP_CONFIG)
+    if not saved:
+        saved = {"enabled": True, "rules": []}
+    if self_only is not None:
+        saved["self_only"] = bool(self_only)
+    elif "self_only" not in saved:
+        saved["self_only"] = True
+    if killfeed_sim is not None:
+        saved["killfeed_sim"] = bool(killfeed_sim)
+    elif "killfeed_sim" not in saved:
+        saved["killfeed_sim"] = True
+    try:
+        tmp = str(SS.SWAP_CONFIG) + ".tmp"
+        Path(tmp).write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, str(SS.SWAP_CONFIG))
+        return True, saved
+    except Exception as e:
+        return False, "写入换肤选项失败：%r" % (e,)
 
 
 def skin_ensure_bundles(codes, emit=None):
     import skin_swap as SS
     return SS.ensure_bundles_cached(codes, emit=emit)
+
+
+# ---------------------------------------------------------------- 第三方自定义 Mod
+def custom_mods_list():
+    import custom_mods as CM
+    return CM.list_mods()
+
+
+def custom_mods_export_textures(weapon_code, out_dir):
+    import custom_mods as CM
+    return CM.export_weapon_textures(weapon_code, out_dir)
+
+
+def custom_mods_import(src_path, target_bundle="", mod_name=""):
+    import custom_mods as CM
+    return CM.import_mod(src_path, target_bundle=target_bundle, mod_name=mod_name)
+
+
+def custom_mods_toggle(mod_id, enabled):
+    import custom_mods as CM
+    return CM.set_mod_enabled(mod_id, enabled)
+
+
+def custom_mods_delete(mod_id):
+    import custom_mods as CM
+    return CM.delete_mod(mod_id)
 
 
 # ---------------------------------------------------------------- 全局设置持久化与启动自动恢复
@@ -1322,8 +1506,8 @@ def startup_housekeeping():
     except Exception:
         pass
 
-    # 3.5 代理残留自愈：异常崩溃未走 shutdown_all() 时，清理未锁定的 .bak-* 与孤立 .ver*.dat；
-    # 若注入开关未开启，顺便清理残留的我方 version.dll，避免“关着工具箱进不去游戏”。
+    # 3.5 代理残留自愈：异常崩溃未走 shutdown_all() 时，清理未锁定的 .bak-* 与孤立 .hid*.dat/.ver*.dat；
+    # 若注入开关未开启，顺便清理残留的我方 hid.dll（及旧版 version.dll），避免“关着工具箱进不去游戏”。
     proxy_cleaned = {"bak": 0, "alt": 0, "dll": 0}
     try:
         cfg = _risk_mod("config").load(reload=True)

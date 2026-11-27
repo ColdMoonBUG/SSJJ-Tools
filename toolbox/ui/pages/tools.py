@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import inspect
+import os
+import subprocess
 import threading
 import time
 
@@ -40,6 +42,7 @@ class ToolsPage(ScrollPage):
         self._busy = False
         self._latest_info = None
         self._upd_cancel = None
+        self._saved_upd_path = ""
 
         self.root.addWidget(page_header(
             "设置", "软件更新、诊断日志导出与常用目录。服务与 hosts 已全部整合至「本地加速」页。"))
@@ -66,12 +69,16 @@ class ToolsPage(ScrollPage):
         self.btn_cancel_upd = QPushButton("取消下载")
         self.btn_cancel_upd.setVisible(False)
         self.btn_cancel_upd.clicked.connect(self._cancel_update)
+        self.btn_open_upd_dir = QPushButton("打开所在文件夹")
+        self.btn_open_upd_dir.setVisible(False)
+        self.btn_open_upd_dir.clicked.connect(lambda: self._open_update_dir())
         self.btn_open_rel = QPushButton("打开发布页")
         self.btn_open_rel.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl(RELEASES_URL)))
         r_upd.addWidget(self.btn_check_upd)
         r_upd.addWidget(self.btn_pull_upd)
         r_upd.addWidget(self.btn_cancel_upd)
+        r_upd.addWidget(self.btn_open_upd_dir)
         r_upd.addWidget(self.btn_open_rel)
         r_upd.addStretch(1)
         upd.add_layout(r_upd)
@@ -97,6 +104,7 @@ class ToolsPage(ScrollPage):
 
         self.lb_upd_msg = dim("点击「检查更新」查看 GitHub 最新版本；仅拉取 .exe 便携包。", small=True)
         self.lb_upd_msg.setWordWrap(True)
+        self.lb_upd_msg.setTextInteractionFlags(Qt.TextSelectableByMouse)
         upd.add(self.lb_upd_msg)
         self.root.addWidget(upd)
 
@@ -230,6 +238,23 @@ class ToolsPage(ScrollPage):
 
         self.run(job, on_done=done)
 
+    def _open_update_dir(self, path=None):
+        target = str(path or self._saved_upd_path or "").strip()
+        if not target:
+            return
+        norm = os.path.normpath(target)
+        try:
+            if os.path.isfile(norm):
+                subprocess.Popen(["explorer.exe", "/select,%s" % norm])
+                return
+            folder = norm if os.path.isdir(norm) else os.path.dirname(norm)
+            if folder:
+                backend.open_path(folder)
+        except Exception:
+            folder = os.path.dirname(norm)
+            if folder:
+                backend.open_path(folder)
+
     def _cancel_update(self):
         if self._upd_cancel is not None:
             self._upd_cancel.set()
@@ -240,13 +265,15 @@ class ToolsPage(ScrollPage):
 
     def _on_upd_progress(self, pct, detail):
         if pct < 0:
-            if self.prog_upd.maximum() != 0:
+            if self.prog_upd.minimum() != 0 or self.prog_upd.maximum() != 0:
                 self.prog_upd.setRange(0, 0)
         else:
-            if self.prog_upd.maximum() != 100:
+            if self.prog_upd.minimum() != 0 or self.prog_upd.maximum() != 100:
                 self.prog_upd.setRange(0, 100)
-            self.prog_upd.setValue(max(0, min(100, int(pct))))
-        if detail:
+            val = max(0, min(100, int(pct)))
+            if self.prog_upd.value() != val:
+                self.prog_upd.setValue(val)
+        if detail and self.lb_upd_msg.text() != detail:
             self.lb_upd_msg.setText(detail)
 
     def _pull_update(self):
@@ -262,16 +289,18 @@ class ToolsPage(ScrollPage):
             return
         self._busy = True
         self._upd_cancel = threading.Event()
+        self._saved_upd_path = ""
         cancel_ev = self._upd_cancel
         self.btn_check_upd.setEnabled(False)
         self.btn_pull_upd.setEnabled(False)
+        self.btn_open_upd_dir.setVisible(False)
         self.btn_cancel_upd.setEnabled(True)
         self.btn_cancel_upd.setVisible(True)
         self.prog_upd.setRange(0, 0)
         self.prog_upd.setVisible(True)
         self.badge_upd.setText("下载中…")
         self.badge_upd.state("")
-        self.lb_upd_msg.setText("正在连接加速线路，准备下载 %s…" % (asset or "新版本"))
+        self.lb_upd_msg.setText("正在测速选择最快加速线路，准备下载 %s…" % (asset or "新版本"))
 
         def job(w):
             state = {
@@ -282,12 +311,55 @@ class ToolsPage(ScrollPage):
                 "speed": 0.0,
             }
 
-            def on_status(msg):
-                text = str(msg or "").strip()
-                if not text:
+            def on_status(payload):
+                now = time.monotonic()
+                if isinstance(payload, dict):
+                    stage = str(payload.get("stage") or "downloading").strip().lower()
+                    mirror = str(payload.get("mirror") or state["mirror"] or "").strip()
+                    if mirror:
+                        state["mirror"] = mirror
+                    if stage == "probing":
+                        w.progress.emit(-1, "正在测速选择最快加速线路…")
+                        return
+                    if stage == "verifying":
+                        w.progress.emit(100, "下载完成，正在校验文件完整性…")
+                        return
+                    if stage == "done":
+                        w.progress.emit(100, "校验通过，准备就绪…")
+                        return
+                    got = int(payload.get("got") or 0)
+                    total = int(payload.get("total") or 0)
+                    speed = float(payload.get("speed") or 0.0)
+                    eta = float(payload.get("eta") if payload.get("eta") is not None else -1.0)
+                    pct = int(payload.get("pct")) if payload.get("pct") is not None else (
+                        min(100, int(got * 100 / total)) if total > 0 else -1
+                    )
+                    if total <= 0:
+                        pct = -1
+                    if got > 0 and (total <= 0 or got < total) and (now - state["last_emit"]) < 0.15:
+                        return
+                    state["last_emit"] = now
+                    parts = []
+                    if total > 0:
+                        parts.append("%d%%" % max(0, min(100, pct)))
+                        parts.append("%.1f / %.1f MB" % (got / 1048576.0, total / 1048576.0))
+                    else:
+                        parts.append("%.1f MB" % (got / 1048576.0))
+                    sp = _fmt_speed(speed)
+                    if sp:
+                        parts.append(sp)
+                    et = _fmt_eta(eta)
+                    if et:
+                        parts.append(et)
+                    if mirror:
+                        parts.append(mirror)
+                    w.progress.emit(pct, " · ".join(parts))
                     return
-                state["mirror"] = text
-                w.progress.emit(-1, text)
+
+                text = str(payload or "").strip()
+                if text:
+                    state["mirror"] = text
+                    w.progress.emit(-1, text)
 
             def on_prog(got, total, *extra):
                 now = time.monotonic()
@@ -311,7 +383,7 @@ class ToolsPage(ScrollPage):
                     state["speed"] = inst if state["speed"] <= 0 else (state["speed"] * 0.6 + inst * 0.4)
                     state["last_got"] = got
                     state["last_t"] = now
-                if got > 0 and (total <= 0 or got < total) and (now - state["last_emit"]) < 0.1:
+                if got > 0 and (total <= 0 or got < total) and (now - state["last_emit"]) < 0.15:
                     return
                 state["last_emit"] = now
                 parts = []
@@ -333,31 +405,36 @@ class ToolsPage(ScrollPage):
                     parts.append(mirror)
                 w.progress.emit(pct, " · ".join(parts))
 
-            kwargs = {"expected_size": size, "progress_cb": on_prog}
+            kwargs = {"expected_size": size}
             try:
                 params = inspect.signature(backend.download_update).parameters
+                if "status_cb" in params:
+                    # 后端支持结构化 status_cb 时仅传单一信号源，避免双回调互殴导致进度条抽搐
+                    kwargs["progress_cb"] = None
+                    kwargs["status_cb"] = on_status
+                else:
+                    kwargs["progress_cb"] = on_prog
                 if "cancel_event" in params:
                     kwargs["cancel_event"] = cancel_ev
-                if "status_cb" in params:
-                    kwargs["status_cb"] = on_status
                 if "expected_sha256" in params and expected_sha256:
                     kwargs["expected_sha256"] = expected_sha256
             except (TypeError, ValueError):
-                pass
+                kwargs["progress_cb"] = on_prog
             return backend.download_update(url, asset, **kwargs)
 
         def done(res):
             was_cancelled = bool(cancel_ev.is_set())
             self._busy = False
             self._upd_cancel = None
-            self.prog_upd.setVisible(False)
-            self.prog_upd.setRange(0, 100)
-            self.prog_upd.setValue(0)
             self.btn_cancel_upd.setVisible(False)
             self.btn_cancel_upd.setEnabled(True)
             self.btn_check_upd.setEnabled(True)
             ok, msg, saved_path, bat_path = res or (False, "下载未完成", "", "")
             if not ok:
+                self.prog_upd.setVisible(False)
+                self.prog_upd.setRange(0, 100)
+                self.prog_upd.setValue(0)
+                self.btn_open_upd_dir.setVisible(False)
                 if was_cancelled or "取消" in str(msg):
                     self.badge_upd.setText("已取消")
                     self.badge_upd.state("")
@@ -368,20 +445,50 @@ class ToolsPage(ScrollPage):
                     self.lb_upd_msg.setText("拉取更新失败：%s（可重试或点「打开发布页」手动下载）" % msg)
                 self.btn_pull_upd.setEnabled(True)
                 return
+
+            self._saved_upd_path = str(saved_path or "")
+            self.prog_upd.setRange(0, 100)
+            self.prog_upd.setValue(100)
+            self.prog_upd.setVisible(True)
             self.badge_upd.setText("下载完成")
             self.badge_upd.state("ok")
-            self.lb_upd_msg.setText("已保存：%s" % saved_path)
+            if self._saved_upd_path:
+                self.btn_open_upd_dir.setVisible(True)
+            in_appdata = "ssjj-toolbox" in self._saved_upd_path.lower() and "updates" in self._saved_upd_path.lower()
+            loc_hint = "（当前目录不可写，已回落保存至 AppData 更新目录）" if in_appdata else "（已保存在当前工具箱同目录）"
+            self.lb_upd_msg.setText("新版已保存%s：%s" % (loc_hint, self._saved_upd_path))
+
+            box = QMessageBox(self)
+            box.setWindowTitle("更新已就绪")
+            box.setIcon(QMessageBox.Information)
+            box.setText(
+                "新版本已下载并校验完成，保存位置：\n%s\n%s"
+                % (self._saved_upd_path, loc_hint)
+            )
+            btn_launch = None
             if bat_path:
-                ans = QMessageBox.question(
-                    self,
-                    "更新已就绪",
-                    "新版本已下载到：\n%s\n\n是否立即关闭当前版本并启动新版本？" % saved_path,
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes,
-                )
-                if ans == QMessageBox.Yes:
-                    backend.launch_update_script(bat_path)
+                btn_launch = box.addButton("立即关闭并启动新版", QMessageBox.AcceptRole)
+            btn_folder = box.addButton("打开所在文件夹", QMessageBox.ActionRole)
+            box.addButton("稍后手动启动", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_launch or btn_folder)
+            box.exec()
+            clicked = box.clickedButton()
+            if btn_launch is not None and clicked is btn_launch:
+                launched = False
+                try:
+                    launched = bool(backend.launch_update_script(bat_path))
+                except Exception:
+                    launched = False
+                if launched:
                     self.app.close()
+                else:
+                    self.badge_upd.setText("请手动启动")
+                    self.badge_upd.state("bad")
+                    self.lb_upd_msg.setText(
+                        "自动拉起新版本失败，请点击「打开所在文件夹」手动运行：%s" % self._saved_upd_path
+                    )
+            elif clicked is btn_folder:
+                self._open_update_dir(self._saved_upd_path)
 
         self.run(job, on_done=done, log=self.lb_upd_msg.setText, progress=self._on_upd_progress)
 

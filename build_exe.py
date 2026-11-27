@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from toolbox.updater import APP_VERSION
 
 ROOT = Path(__file__).resolve().parent
 ENTRY = ROOT / "toolbox" / "ssjj_toolbox.py"
@@ -31,7 +32,7 @@ def main(argv=None):
     if not ENTRY.is_file():
         raise SystemExit("找不到入口: %s" % ENTRY)
 
-    # 代理将托管载荷直接编进 version.dll。每次打包先重编这两层，
+    # 代理将托管载荷直接编进 hid.dll。每次打包先重编这两层，
     # 否则 exe 会携带上次的代理，即使 payload/bin 已经是新版本。
     if "--use-existing-proxy" not in argv:
         from risk import injector
@@ -53,13 +54,12 @@ def main(argv=None):
         # 预编译载荷：打包版没有 dotnet，注入时只能读包内这一份
         # 目标目录必须正好是 risk\payload（injector.payload_candidates() 里按这个找）
         "--add-data", "%s;risk\\payload" % PAYLOAD,
-        # version.dll 代理（进程内加载通道）。不带这个，点「部署代理」会找不到 DLL。
-        "--add-data", "%s;risk\\proxy" % (ROOT / "risk" / "proxy" / "version.dll"),
+        # hid.dll 代理（进程内加载通道）。不带这个，点「部署代理」会找不到 DLL。
+        "--add-data", "%s;risk\\proxy" % (ROOT / "risk" / "proxy" / "hid.dll"),
         "--add-data", "%s;." % (ROOT / "weapon_catalog.json"),
         # 保留 bundle_index.json 供旧静态记录还原与皮肤目录兜底
         "--add-data", "%s;toolbox\\data" % (ENTRY.parent / "data"),
-        # 大厅反编译脚本、缓存库、_analysis 及已停用的静态改包重依赖都不进包
-        "--exclude-module", "UnityPy",
+        # 大厅反编译脚本、缓存库、_analysis 及已停用的静态改包重依赖都不进包（UnityPy / PIL 保留供自定义 Mod 使用）
         "--exclude-module", "fmod_toolkit",
         "--exclude-module", "pyfmodex",
         "--exclude-module", "matplotlib",
@@ -73,7 +73,7 @@ def main(argv=None):
     # backend 里风险模式是 importlib.import_module("risk." + name) 动态导入的，
     # PyInstaller 静态分析看不到，必须在命令行里逐个点名，否则打包版点「风险」页
     # 直接 ModuleNotFoundError。
-    for mod in ("quick_login", "skin_swap", "skin_pack", "oneclick",
+    for mod in ("quick_login", "skin_swap", "skin_pack", "custom_mods", "oneclick",
                 "updater", "diagnostics", "ui.diagnostic_export",
                 "risk", "risk.config", "risk.paths", "risk.swfpatch", "risk.airdesc",
                 "risk.lobby", "risk.injector", "risk.mitm", "risk.guard",
@@ -123,24 +123,24 @@ def main(argv=None):
 
         readme = stage_dir / "使用说明.txt"
         readme.write_text(
-            "================ 生死狙击工具箱（绿色免安装版 1.1） ================\r\n\r\n"
+            f"================ 生死狙击工具箱（绿色免安装版 {APP_VERSION}） ================\r\n\r\n"
             "就一件事：选好皮肤，点一下，进游戏。别的什么都不用开。\r\n\r\n"
             "【怎么用（三步）】\r\n"
             "1. 双击「生死狙击工具箱.exe」，弹出的管理员确认点「是」（必须，因为要往\r\n"
             "   游戏目录写文件）。\r\n"
-            "2. 首页「一键启动」：选武器 → 选想借用的皮肤 → 填账号密码和区服 → 点\r\n"
-            "   「一键启动」。工具箱会自己部署代理、写规则、登录、拉起游戏。\r\n"
+            "2. 首页「一键启动」：选武器与外观，加入规则后点「一键启动」。工具箱\r\n"
+            "   会部署代理并打开官方启动器；请在游戏窗口登录并选择区服。\r\n"
             "3. 想停用换肤：在首页「一键启动」页「⑤ 高级开关」点「移除代理」（正常关闭\r\n"
             "   工具箱也会自动清理已投放的代理文件），下次进游戏就是原样。\r\n\r\n"
             "【换肤是怎么进去的】\r\n"
             "- 加载方式是「代理 DLL」：工具箱往游戏的 battle\\*_64\\ 目录写一个\r\n"
-            "  version.dll。战斗端启动时 Windows 加载器会先加载它，载荷在游戏进程\r\n"
+            "  hid.dll。战斗端启动时 Windows 加载器会先加载它，载荷在游戏进程\r\n"
             "  内部自己进 mono 运行时。\r\n"
             "- 全程不 OpenProcess、不 VirtualAllocEx、不 CreateRemoteThread、不留匿名\r\n"
             "  可执行页 —— 那套跨进程注入会被 GameGuard 当场杀掉（npggNT64.des 报\r\n"
             "  0x80000004），代理 DLL 是唯一能活下来的通道。\r\n"
-            "- 代理一进进程就把自己从模块链表里摘掉并伪装系统路径，同时由自身定时器与\r\n"
-            "  工具箱守护进程协同将文件快速改名成 .ver.dat，绕开 RuntimeCheatGuard 自检。\r\n"
+            "- 代理一进进程就把自己从模块链表里摘掉并伪装系统路径，同时由自身定时器\r\n"
+            "  与工具箱协同将文件快速改名成 .hid.dat，绕开 RuntimeCheatGuard 自检。\r\n"
             "- 换肤规则是「冷加载」：进场应用一次就结束，进程里不留常驻线程。\r\n\r\n"
             "【生效时机】\r\n"
             "- 代理部署后新开一局生效；改规则要退出这一局、重进一局才生效。\r\n"
@@ -150,10 +150,10 @@ def main(argv=None):
             "- 本地加速、资源缓存、根证书、HTTPS 拦截：全部默认关闭，不会偷偷写 hosts、\r\n"
             "  不会往硬盘塞缓存。只影响下载速度，对换肤没帮助，需要时自己在侧栏开。\r\n\r\n"
             "【账号密码】\r\n"
-            "- 用 Windows DPAPI 加密保存在本机，只在登录时用，不上传任何服务器。\r\n"
+            "- 可选账号资料用 Windows DPAPI 加密保存在本机，不传给官方启动器。\r\n"
             "- 不想存就取消勾选「记住账号和密码」。\r\n\r\n"
             "【换台电脑能不能用】\r\n"
-            "- 全部依赖都打在 exe 里：Qt 界面、代理 version.dll、托管载荷、武器皮肤清单\r\n"
+            "- 全部依赖都打在 exe 里：Qt 界面、代理 hid.dll、托管载荷、武器皮肤清单\r\n"
             "  （1200+ 武器 / 470+ 皮肤）全在包内，不需要 Python、不需要 .NET、不需要\r\n"
             "  联网下任何数据文件，解压就能用。\r\n"
             "- 游戏目录自动探测（默认路径 + 注册表 + 卸载表 + 各盘符扫描），装在 D 盘、\r\n"
@@ -178,14 +178,14 @@ def main(argv=None):
             "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\\生死狙击工具箱.lnk');"
             "$s.TargetPath='%TARGET%';"
             "$s.WorkingDirectory='%~dp0';"
-            "$s.Description='生死狙击工具箱 - 一键直登与武器换肤';"
+            "$s.Description='生死狙击工具箱 - 官方启动与武器换肤';"
             "$s.Save()\"\r\n"
             "echo 已在桌面创建「生死狙击工具箱」快捷方式！\r\n"
             "pause\r\n",
             encoding="utf-8",
         )
 
-        zip_name = "生死工具箱1.1"
+        zip_name = "生死工具箱" + APP_VERSION
         for a in argv:
             if a.startswith("--zip-name="):
                 zip_name = a.split("=", 1)[1].strip() or zip_name

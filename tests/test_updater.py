@@ -127,6 +127,87 @@ class UpdaterOfflineTest(unittest.TestCase):
             self.assertEqual(saved, "")
             self.assertIn("取消", msg)
 
+    def test_launch_update_script_strips_pyi_env(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ps1 = Path(folder) / "ssjj_update_test.ps1"
+            ps1.write_text("# test\n", encoding="utf-8-sig")
+            captured = {}
+
+            def fake_popen(cmd, **kwargs):
+                captured["cmd"] = cmd
+                captured["env"] = kwargs.get("env")
+                return object()
+
+            fake_env = {
+                "PATH": "C:\\Windows\\System32",
+                "_PYI_APPLICATION_HOME_DIR": "C:\\Temp\\_MEI123",
+                "_PYI_ARCHIVE_FILE": "C:\\Temp\\old.exe",
+                "_MEIPASS2": "C:\\Temp\\_MEI123",
+                "TEMP": "C:\\Temp",
+            }
+            with patch.dict("os.environ", fake_env, clear=True), \
+                 patch("subprocess.Popen", side_effect=fake_popen):
+                ok = updater.launch_update_script(str(ps1))
+
+            self.assertTrue(ok)
+            env = captured.get("env")
+            self.assertIsInstance(env, dict, "launch_update_script 应显式传入清洗后的 env")
+            for k in env:
+                self.assertFalse(k.upper().startswith("_PYI_"), "不应残留 _PYI_* 环境变量: %s" % k)
+                self.assertFalse(k.upper().startswith("_MEIPASS"), "不应残留 _MEIPASS* 环境变量: %s" % k)
+            self.assertEqual(env.get("PATH"), "C:\\Windows\\System32")
+
+    def test_write_replace_script_has_dual_pid_wait_log_and_explorer_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            staged = Path(folder) / "app-new.exe"
+            final = Path(folder) / "app-new.exe"
+            ps1_path = updater._write_replace_script(staged, final, same_as_running=False)
+            try:
+                content = Path(ps1_path).read_text(encoding="utf-8-sig")
+            finally:
+                Path(ps1_path).unlink(missing_ok=True)
+            self.assertIn("update_launch.log", content)
+            self.assertIn("explorer", content.lower())
+            self.assertTrue(
+                ("parentPid" in content or "ppid" in content.lower() or "pids" in content.lower() or "Wait" in content),
+                "替换脚本应包含双 PID 等待逻辑",
+            )
+
+    def test_quick_login_launch_official_prefers_launcher_and_falls_back_to_microclient(self):
+        import quick_login
+        with tempfile.TemporaryDirectory() as folder:
+            gdir = Path(folder)
+            mc_dir = gdir / "MicroClient64"
+            mc_dir.mkdir(parents=True)
+            mc_exe = mc_dir / "MicroClient.exe"
+            mc_exe.write_bytes(b"MZ")
+            wd_exe = gdir / "WDlauncher.exe"
+            wd_exe.write_bytes(b"MZ")
+            calls = []
+
+            def fake_shell_exec(hwnd, op, file_path, params, work_dir, show):
+                calls.append((op, file_path, params, work_dir))
+                return 42
+
+            with patch.object(quick_login.P, "GAME_DIR", str(gdir)), \
+                 patch.object(quick_login, "active_official_lobby", return_value=False), \
+                 patch.object(quick_login.ctypes.windll.shell32, "ShellExecuteW", side_effect=fake_shell_exec), \
+                 patch.object(quick_login, "_log_launch"), \
+                 patch.object(quick_login, "_watch_launch"):
+                ok1, msg1 = quick_login.launch_official()
+                wd_exe.unlink()
+                ok2, msg2 = quick_login.launch_official()
+
+            self.assertTrue(ok1, msg1)
+            self.assertTrue(ok2, msg2)
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(calls[0][1].lower().endswith("wdlauncher.exe"))
+            self.assertIsNone(calls[0][2])
+            self.assertEqual(Path(calls[0][3]).resolve(), gdir.resolve())
+            self.assertTrue(calls[1][1].lower().endswith("microclient.exe"))
+            self.assertIsNone(calls[1][2])
+            self.assertEqual(Path(calls[1][3]).resolve(), gdir.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

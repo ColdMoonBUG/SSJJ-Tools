@@ -7,10 +7,12 @@
 """
 import os
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
-                               QGridLayout, QHBoxLayout, QHeaderView, QLabel,
-                               QLineEdit, QPushButton, QSpinBox, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout)
+                               QFileDialog, QGridLayout, QHBoxLayout,
+                               QHeaderView, QLabel, QLineEdit, QMenu,
+                               QPushButton, QSpinBox, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 import backend
 import oneclick
@@ -40,6 +42,7 @@ class OneclickPage(ScrollPage):
         self._skin_names = {}      # 皮肤包 code -> 中文名
         self._skins = []           # 当前武器的 [(短名, 显示名)]
         self._rules = []           # 与「武器皮肤」页共用的规则表
+        self._mods = []            # 已导入的第三方自定义 Mod 列表
 
         self.root.addWidget(page_header(
             "一键启动",
@@ -130,6 +133,22 @@ class OneclickPage(ScrollPage):
         r3.addWidget(self.btn_add_rule)
         look.add_layout(r3)
 
+        # 第 4 行：本地独占与击杀播报模拟开关（写入 skin_swap.json 的 self_only / killfeed_sim）
+        r_opts = QHBoxLayout()
+        r_opts.setSpacing(16)
+        self.chk_self_only = QCheckBox("仅替换自己（不影响其他玩家）")
+        self.chk_self_only.setChecked(True)
+        self.chk_self_only.setToolTip(
+            "勾上：换肤按本地玩家实体过滤、换模使用本地独立 WeaponInfo 副本，不影响场景内其他玩家。")
+        self.chk_killfeed_sim = QCheckBox("本地模拟击杀播报 / 专属徽标 / 三杀通报")
+        self.chk_killfeed_sim.setChecked(True)
+        self.chk_killfeed_sim.setToolTip(
+            "勾上：纯客户端下行模拟右上角击杀播报武器/专属徽标与三杀通报，绝不伪造上行网络包。")
+        r_opts.addWidget(self.chk_self_only)
+        r_opts.addWidget(self.chk_killfeed_sim)
+        r_opts.addStretch(1)
+        look.add_layout(r_opts)
+
         row = QHBoxLayout()
         row.setSpacing(8)
         self.lb_look = dim("", small=True)
@@ -215,6 +234,45 @@ class OneclickPage(ScrollPage):
         run.add(self.log)
         self.root.addWidget(run)
 
+        # ------------------------------------------------ 第三方自定义 Mod（贴图 / 模型）
+        mods_card = Card("⑥ 第三方自定义 Mod（贴图 / 模型）",
+                         "零注入资源覆盖（走本地加速清单改写）：可导出原枪贴图(PNG)自制涂装，"
+                         "或导入自定义贴图包 / Unity 2019.4 AssetBundle。", glyph="\uE74C")
+        self.badge_mods = Badge("")
+        mods_card.add_header_widget(self.badge_mods)
+        mrow = QHBoxLayout()
+        mrow.setSpacing(8)
+        self.btn_export_uv = QPushButton("导出原枪贴图(PNG)")
+        self.btn_export_uv.setToolTip("按当前选中的武器，导出可编辑 PNG 贴图与 mod.json 模板到指定目录")
+        self.btn_import_mod = QPushButton("导入自定义 Mod（zip/目录/bundle）")
+        self.btn_import_mod.setToolTip("导入自定义贴图包(.zip / 目录)或 Unity 2019.4 AssetBundle(.bundle)")
+        self.btn_refresh_mods = QPushButton("刷新列表")
+        mrow.addWidget(self.btn_export_uv)
+        mrow.addWidget(self.btn_import_mod)
+        mrow.addWidget(self.btn_refresh_mods)
+        mrow.addStretch(1)
+        mods_card.add_layout(mrow)
+
+        self.tbl_mods = QTableWidget(0, 5)
+        self.tbl_mods.setHorizontalHeaderLabels(["名称", "目标包", "类型", "启用", "操作"])
+        self.tbl_mods.verticalHeader().setVisible(False)
+        self.tbl_mods.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_mods.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl_mods.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tbl_mods.setAlternatingRowColors(True)
+        self.tbl_mods.setMinimumHeight(110)
+        mhh = self.tbl_mods.horizontalHeader()
+        mhh.setSectionResizeMode(0, QHeaderView.Stretch)
+        mhh.setSectionResizeMode(1, QHeaderView.Stretch)
+        mhh.setSectionResizeMode(2, QHeaderView.Fixed)
+        mhh.setSectionResizeMode(3, QHeaderView.Fixed)
+        mhh.setSectionResizeMode(4, QHeaderView.Fixed)
+        self.tbl_mods.setColumnWidth(2, 86)
+        self.tbl_mods.setColumnWidth(3, 64)
+        self.tbl_mods.setColumnWidth(4, 72)
+        mods_card.add(self.tbl_mods)
+        self.root.addWidget(mods_card)
+
         # ------------------------------------------------ 高级开关
         adv = Card("⑤ 高级开关（默认已调好，不懂别动）",
                    "冷加载＝进场应用一次、进程里不留线程；热加载＝每 500ms 重读配置，"
@@ -222,12 +280,12 @@ class OneclickPage(ScrollPage):
         ar0 = QHBoxLayout()
         ar0.setSpacing(10)
         self.cmb_method = QComboBox()
-        self.cmb_method.addItem("加载方式：代理 DLL（version.dll · 游戏启动时自加载，最隐蔽）", "proxy")
+        self.cmb_method.addItem("加载方式：代理 DLL（hid.dll · 游戏启动时自加载，最隐蔽）", "proxy")
         if str(os.environ.get("SSJJ_ALLOW_THREAD_INJECT") or "").strip() == "1":
             self.cmb_method.addItem("加载方式：远程线程注入（会被 GameGuard 当场杀，仅调试用）", "thread")
         self.cmb_method.setMinimumWidth(430)
         self.cmb_method.setToolTip(
-            "代理 DLL：往 battle\\*_64\\ 放一个 version.dll，战斗端加载器会先加载它，"
+            "代理 DLL：往 battle\\*_64\\ 放一个 hid.dll，战斗端加载器会先加载它，"
             "载荷在进程内自己进 mono。全程不 OpenProcess / 不建远程线程 / 不留匿名可执行页。")
         self.btn_proxy_deploy = QPushButton("部署代理")
         self.btn_proxy_remove = QPushButton("移除代理")
@@ -284,11 +342,11 @@ class OneclickPage(ScrollPage):
         self.root.addWidget(adv)
         self.root.addStretch(1)
 
-        # 顺序：启动游戏 → 选外观 → 当前规则 → 高级（原来的构建顺序是 外观在最前）
+        # 顺序：启动游戏 → 选外观 → 当前规则 → 第三方自定义 Mod → 高级（原来的构建顺序是 外观在最前）
         _tail = self.root.takeAt(self.root.count() - 1)
-        for _w in (acc, run, look, rules_card, adv):
+        for _w in (acc, run, look, rules_card, mods_card, adv):
             self.root.removeWidget(_w)
-        for _w in (acc, run, look, rules_card, adv):
+        for _w in (acc, run, look, rules_card, mods_card, adv):
             self.root.addWidget(_w)
         if _tail is not None:
             self.root.addItem(_tail)
@@ -297,9 +355,14 @@ class OneclickPage(ScrollPage):
         self.btn_go.clicked.connect(lambda: self._go(swap=True))
         self.btn_plain.clicked.connect(lambda: self._go(swap=False))
         self.btn_add_rule.clicked.connect(self._add_rule)
+        self.chk_self_only.toggled.connect(lambda on: self._skin_opt_toggled("self_only", on))
+        self.chk_killfeed_sim.toggled.connect(lambda on: self._skin_opt_toggled("killfeed_sim", on))
         self.btn_del_rule.clicked.connect(self._del_rule)
         self.btn_reset_files.clicked.connect(self._restore)
         self.btn_clear_rules.clicked.connect(self._clear_rules)
+        self.btn_export_uv.clicked.connect(self._export_weapon_uv)
+        self.btn_import_mod.clicked.connect(self._import_mod_menu)
+        self.btn_refresh_mods.clicked.connect(self._refresh_mods)
         self.chk_cold.toggled.connect(self._cold_toggled)
         self.cmb_ace.currentIndexChanged.connect(self._ace_changed)
         self.chk_auto.toggled.connect(self._auto_toggled)
@@ -317,11 +380,40 @@ class OneclickPage(ScrollPage):
         self._load_profile()
 
     # ------------------------------------------------------------ 数据
+    @staticmethod
+    def _call_mod_api(backend_names, mod_fn_name, *args, **kwargs):
+        for name in backend_names:
+            fn = getattr(backend, name, None)
+            if callable(fn):
+                return fn(*args, **kwargs)
+        try:
+            import custom_mods as CM
+            fn = getattr(CM, mod_fn_name, None)
+            if callable(fn):
+                return fn(*args, **kwargs)
+        except Exception:
+            pass
+        return None
+
     def refresh(self):
         def job(*_a):
             try:
-                return {"cat": backend.skin_catalog(), "st": oneclick.status(),
-                        "admin": backend.is_admin()}
+                skin_cfg = {}
+                try:
+                    skin_cfg = backend.skin_load_rules() or {}
+                except Exception:
+                    skin_cfg = {}
+                mods = self._call_mod_api(
+                    ("custom_mods_list", "custom_mod_list", "list_custom_mods"),
+                    "list_mods",
+                )
+                return {
+                    "cat": backend.skin_catalog(),
+                    "st": oneclick.status(),
+                    "admin": backend.is_admin(),
+                    "skin_cfg": skin_cfg,
+                    "mods": mods if isinstance(mods, list) else [],
+                }
             except Exception:
                 import traceback
                 self._dbg("refresh FAIL\n" + traceback.format_exc())
@@ -414,6 +506,15 @@ class OneclickPage(ScrollPage):
         self._refill_models()
         self._weapon_changed()
         self._render_rules()
+        skin_cfg = d.get("skin_cfg") or {}
+        for _w, _k in ((self.chk_self_only, "self_only"),
+                       (self.chk_killfeed_sim, "killfeed_sim")):
+            _v = skin_cfg.get(_k, True)
+            _w.blockSignals(True)
+            _w.setChecked(True if _v is None else bool(_v))
+            _w.blockSignals(False)
+        self._mods = list(d.get("mods") or [])
+        self._render_mods()
         # 高级开关同步
         for _w, _v in ((self.chk_cold, st.get("cold_swap", True)),
                        (self.chk_auto, st.get("auto_elevate", False)),
@@ -659,7 +760,7 @@ class OneclickPage(ScrollPage):
         try:
             backend.risk_inject_option("method", mode)
             if mode == "proxy":
-                self.log.line("[OK] 加载方式 = 代理 DLL（version.dll）")
+                self.log.line("[OK] 加载方式 = 代理 DLL（hid.dll）")
             else:
                 self.log.line("[!] 加载方式 = 远程线程注入：GameGuard 会在 CreateRemoteThread "
                               "那一刻用 0x80000004 杀掉战斗端，只在没有反作弊的环境里用")
@@ -859,11 +960,230 @@ class OneclickPage(ScrollPage):
 
         self.run(job, on_done=done, log=self._emit)
 
+    def _skin_opt_toggled(self, key, on):
+        label = "仅替换自己" if key == "self_only" else "本地击杀播报模拟"
+        try:
+            setter_multi = getattr(backend, "skin_set_options", None)
+            setter = getattr(backend, "skin_set_option", None) or getattr(backend, "skin_option", None)
+            if callable(setter_multi):
+                res = setter_multi(**{key: bool(on)})
+                if isinstance(res, tuple) and not res[0]:
+                    self.log.line("[!] 保存 %s 失败：%s" % (label, res[1]))
+                    return
+            elif callable(setter):
+                res = setter(key, bool(on))
+                if isinstance(res, tuple) and not res[0]:
+                    self.log.line("[!] 保存 %s 失败：%s" % (label, res[1]))
+                    return
+            else:
+                data = backend.skin_load_rules() or {}
+                data[key] = bool(on)
+                try:
+                    import skin_swap as SS
+                    SS.save_rules(data, allow_empty=True)
+                except TypeError:
+                    backend.skin_save_rules(data)
+            self.log.line("[OK] %s：%s（下一局生效）" % (label, "已开启" if on else "已关闭"))
+        except Exception as exc:
+            self.log.line("[!] 保存 %s 失败：%r" % (label, exc))
+
+    # ------------------------------------------------------------ 第三方自定义 Mod
+    def _render_mods(self):
+        mods = list(self._mods or [])
+        self.tbl_mods.setRowCount(len(mods))
+        type_labels = {"texture_pack": "贴图包", "assetbundle": "模型包(AB)"}
+        enabled_n = 0
+        for i, m in enumerate(mods):
+            mod_id = str(m.get("id") or "")
+            name = str(m.get("name") or mod_id or "(未命名)")
+            target = str(m.get("target_bundle") or m.get("target") or m.get("weapon") or "")
+            mtype = str(m.get("type") or "")
+            enabled = bool(m.get("enabled", True))
+            if enabled:
+                enabled_n += 1
+            self.tbl_mods.setItem(i, 0, QTableWidgetItem(name))
+            self.tbl_mods.setItem(i, 1, QTableWidgetItem(target))
+            self.tbl_mods.setItem(i, 2, QTableWidgetItem(type_labels.get(mtype, mtype or "未知")))
+
+            chk_wrap = QWidget()
+            cl = QHBoxLayout(chk_wrap)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setAlignment(Qt.AlignCenter)
+            chk = QCheckBox()
+            chk.setChecked(enabled)
+            chk.toggled.connect(lambda state, mid=mod_id: self._toggle_mod(mid, state))
+            cl.addWidget(chk)
+            self.tbl_mods.setCellWidget(i, 3, chk_wrap)
+
+            btn_del = QPushButton("删除")
+            btn_del.setObjectName("Danger")
+            btn_del.clicked.connect(lambda _checked=False, mid=mod_id: self._delete_mod(mid))
+            self.tbl_mods.setCellWidget(i, 4, btn_del)
+
+        if mods:
+            self.badge_mods.setText("共 %d 个 · 已启用 %d" % (len(mods), enabled_n))
+            self.badge_mods.state("ok" if enabled_n else "")
+        else:
+            self.badge_mods.setText("暂无自定义 Mod")
+            self.badge_mods.state("")
+
+    def _refresh_mods(self):
+        def job(*_a):
+            mods = self._call_mod_api(
+                ("custom_mods_list", "custom_mod_list", "list_custom_mods"),
+                "list_mods",
+            )
+            return mods if isinstance(mods, list) else []
+
+        def done(mods):
+            self._mods = list(mods or [])
+            self._render_mods()
+
+        self.run(job, on_done=done)
+
+    @staticmethod
+    def _parse_mod_result(res, ok_fallback="操作完成", err_fallback="操作失败"):
+        if isinstance(res, dict):
+            ok = bool(res.get("ok"))
+            if ok:
+                msg = res.get("msg") or res.get("message") or ok_fallback
+                warn = res.get("warning")
+                if warn:
+                    msg = "%s（提示：%s）" % (msg, warn)
+                return True, str(msg)
+            return False, str(res.get("error") or res.get("msg") or err_fallback)
+        if isinstance(res, tuple) and len(res) >= 2:
+            return bool(res[0]), str(res[1])
+        return bool(res), str(res or (ok_fallback if res else err_fallback))
+
+    def _export_weapon_uv(self):
+        if self._busy:
+            return
+        weapon = self.cmb_weapon.currentData() or ""
+        if not weapon:
+            self.log.line("[!] 请先在上方选择一把武器，再导出原枪贴图")
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "选择导出原枪贴图(PNG)与模板的目录")
+        if not out_dir:
+            return
+        self._set_busy(True)
+
+        def job(*_a):
+            res = self._call_mod_api(
+                ("custom_mod_export_textures", "custom_mods_export_textures",
+                 "export_weapon_textures"),
+                "export_weapon_textures",
+                weapon, out_dir,
+            )
+            if res is None:
+                return {"ok": False, "error": "当前后端未提供自定义 Mod 导出接口"}
+            return res
+
+        def done(res):
+            self._set_busy(False)
+            ok_txt = ("已导出 %d 张原枪贴图与 mod.json 模板到 %s" % (res.get("count", 0), res.get("out_dir", out_dir))
+                      if isinstance(res, dict) else "导出完成")
+            ok, msg = self._parse_mod_result(res, ok_fallback=ok_txt, err_fallback="导出失败")
+            self.log.line(("[OK] " if ok else "[!] ") + msg)
+
+        self.run(job, on_done=done)
+
+    def _import_mod_menu(self):
+        if self._busy:
+            return
+        menu = QMenu(self)
+        act_file = menu.addAction("导入 Mod 文件（.zip / .bundle）")
+        act_dir = menu.addAction("导入 Mod 文件夹（含 mod.json）")
+        picked = menu.exec(self.btn_import_mod.mapToGlobal(self.btn_import_mod.rect().bottomLeft()))
+        if picked == act_file:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择自定义 Mod 文件", "",
+                "自定义 Mod (*.zip *.bundle);;所有文件 (*.*)")
+            if path:
+                self._import_mod_from_path(path)
+        elif picked == act_dir:
+            path = QFileDialog.getExistingDirectory(self, "选择自定义 Mod 文件夹")
+            if path:
+                self._import_mod_from_path(path)
+
+    def _import_mod_from_path(self, src_path):
+        if self._busy or not src_path:
+            return
+        weapon = self.cmb_weapon.currentData() or ""
+        self._set_busy(True)
+
+        def job(*_a):
+            for name in ("custom_mod_import", "custom_mods_import", "import_custom_mod"):
+                fn = getattr(backend, name, None)
+                if callable(fn):
+                    try:
+                        return fn(src_path, target_bundle=weapon)
+                    except TypeError:
+                        return fn(src_path)
+            try:
+                import custom_mods as CM
+                return CM.import_mod(src_path, target_bundle=weapon)
+            except Exception as exc:
+                return {"ok": False, "error": "导入接口不可用：%r" % (exc,)}
+
+        def done(res):
+            self._set_busy(False)
+            mod_name = ((res.get("mod") or {}).get("name") or "") if isinstance(res, dict) else ""
+            ok_txt = "已导入自定义 Mod：%s" % mod_name if mod_name else "已导入自定义 Mod"
+            ok, msg = self._parse_mod_result(res, ok_fallback=ok_txt, err_fallback="导入失败")
+            self.log.line(("[OK] " if ok else "[!] ") + msg)
+            self._refresh_mods()
+
+        self.run(job, on_done=done)
+
+    def _toggle_mod(self, mod_id, enabled):
+        if not mod_id:
+            return
+
+        def job(*_a):
+            res = self._call_mod_api(
+                ("custom_mods_toggle", "custom_mod_toggle", "custom_mod_set_enabled",
+                 "custom_mods_set_enabled", "set_custom_mod_enabled"),
+                "set_mod_enabled",
+                mod_id, bool(enabled),
+            )
+            return res if res is not None else {"ok": False, "error": "切换接口不可用"}
+
+        def done(res):
+            ok_txt = "已%s Mod：%s" % ("启用" if enabled else "禁用", mod_id)
+            ok, msg = self._parse_mod_result(res, ok_fallback=ok_txt, err_fallback="切换失败")
+            self.log.line(("[OK] " if ok else "[!] ") + msg)
+            self._refresh_mods()
+
+        self.run(job, on_done=done)
+
+    def _delete_mod(self, mod_id):
+        if not mod_id or self._busy:
+            return
+        self._set_busy(True)
+
+        def job(*_a):
+            res = self._call_mod_api(
+                ("custom_mod_delete", "custom_mods_delete", "delete_custom_mod"),
+                "delete_mod",
+                mod_id,
+            )
+            return res if res is not None else {"ok": False, "error": "删除接口不可用"}
+
+        def done(res):
+            self._set_busy(False)
+            ok, msg = self._parse_mod_result(res, ok_fallback="已删除 Mod：%s" % mod_id, err_fallback="删除失败")
+            self.log.line(("[OK] " if ok else "[!] ") + msg)
+            self._refresh_mods()
+
+        self.run(job, on_done=done)
+
     # ------------------------------------------------------------ 动作
     def _set_busy(self, busy):
         self._busy = busy
         for b in (self.btn_go, self.btn_plain, self.btn_add_rule,
                   self.btn_del_rule, self.btn_reset_files, self.btn_clear_rules,
+                  self.btn_export_uv, self.btn_import_mod, self.btn_refresh_mods,
                   self.btn_inj_on, self.btn_inj_off,
                   self.btn_proxy_deploy, self.btn_proxy_remove):
             b.setEnabled(not busy)

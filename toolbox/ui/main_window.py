@@ -391,12 +391,17 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------ 全局状态
     def _poll(self):
+        if getattr(self, "_polling", False):
+            return
+        self._polling = True
+
         def job(_w):
-            return {"running": backend.accel_running(),
+            return {"running": backend.accel_running(timeout=0.3),
                     "admin": backend.is_admin(),
                     "hosts": backend.hosts_marked()}
 
         def done(d):
+            self._polling = False
             if not d:
                 return
             running = d["running"]
@@ -407,13 +412,22 @@ class MainWindow(QWidget):
             self.lb_admin.setText("管理员模式" if d["admin"] else "普通权限（写 hosts 会失败）")
             self.lb_hosts.setText("hosts 已指向本机" if d["hosts"] else "hosts 未写入")
 
-        self.run(lambda w: job(w), on_done=done)
+        self.run(job, on_done=done, quiet=True)
 
-    def run(self, fn, on_done=None):
+    def run(self, fn, on_done=None, quiet=False):
         from ui.widgets import Worker
-        w = Worker(fn, self)
+        w = Worker(fn, self, quiet=quiet)
         if on_done is not None:
             w.done.connect(on_done)
+
+        def _cleanup(_res, _w=w):
+            try:
+                self._workers.remove(_w)
+            except ValueError:
+                pass
+            _w.deleteLater()
+
+        w.done.connect(_cleanup)
         self._workers.append(w)
         w.start()
         return w

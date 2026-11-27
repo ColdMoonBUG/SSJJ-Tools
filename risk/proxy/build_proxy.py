@@ -1,7 +1,7 @@
-"""把 version.dll 代理编译出来（clang + lld-link，无 CRT）。
+"""把 hid.dll 代理编译出来（clang + lld-link，无 CRT）。
 
 用法：
-    python risk\\proxy\\build_proxy.py            # 编译到 risk\\proxy\\version.dll
+    python risk\\proxy\\build_proxy.py            # 编译到 risk\\proxy\\hid.dll
     python risk\\proxy\\build_proxy.py --payload <dll> --out <path>
 
 载荷默认取 risk\\payload\\bin\\System.Configuration.Install.dll（--build 会生成）。
@@ -20,7 +20,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent                      # ssjj-tool
 DEFAULT_PAYLOAD = ROOT / "risk" / "payload" / "bin" / "System.Configuration.Install.dll"
-DEFAULT_OUT = HERE / "version.dll"
+DEFAULT_OUT = HERE / "hid.dll"
 
 LLVM_BIN = Path(os.environ.get("LLVM_BIN") or r"C:\Program Files\LLVM\bin")
 KIT_LIB_CANDIDATES = [
@@ -82,15 +82,50 @@ def build(payload: Path, out: Path) -> Path:
     cmd = [
         link, "/dll", "/entry:DllMain", "/nodefaultlib", "/machine:x64",
         "/out:" + str(out), str(obj), str(Path(lib_dir) / "kernel32.lib"),
-        "/export:VerQueryValueW", "/export:VerQueryValueA",
-        "/export:GetFileVersionInfoW", "/export:GetFileVersionInfoA",
-        "/export:GetFileVersionInfoExW", "/export:GetFileVersionInfoExA",
-        "/export:GetFileVersionInfoSizeW", "/export:GetFileVersionInfoSizeA",
-        "/export:GetFileVersionInfoSizeExW", "/export:GetFileVersionInfoSizeExA",
-        "/export:GetFileVersionInfoByHandle",
-        "/export:VerFindFileA", "/export:VerFindFileW",
-        "/export:VerInstallFileA", "/export:VerInstallFileW",
-        "/export:VerLanguageNameA", "/export:VerLanguageNameW",
+        "/export:HidD_FlushQueue",
+        "/export:HidD_FreePreparsedData",
+        "/export:HidD_GetAttributes",
+        "/export:HidD_GetConfiguration",
+        "/export:HidD_GetFeature",
+        "/export:HidD_GetHidGuid",
+        "/export:HidD_GetIndexedString",
+        "/export:HidD_GetInputReport",
+        "/export:HidD_GetManufacturerString",
+        "/export:HidD_GetMsGenreDescriptor",
+        "/export:HidD_GetNumInputBuffers",
+        "/export:HidD_GetPhysicalDescriptor",
+        "/export:HidD_GetPreparsedData",
+        "/export:HidD_GetProductString",
+        "/export:HidD_GetSerialNumberString",
+        "/export:HidD_Hello",
+        "/export:HidD_SetConfiguration",
+        "/export:HidD_SetFeature",
+        "/export:HidD_SetNumInputBuffers",
+        "/export:HidD_SetOutputReport",
+        "/export:HidP_GetButtonCaps",
+        "/export:HidP_GetCaps",
+        "/export:HidP_GetData",
+        "/export:HidP_GetExtendedAttributes",
+        "/export:HidP_GetLinkCollectionNodes",
+        "/export:HidP_GetScaledUsageValue",
+        "/export:HidP_GetSpecificButtonCaps",
+        "/export:HidP_GetSpecificValueCaps",
+        "/export:HidP_GetUsageValue",
+        "/export:HidP_GetUsageValueArray",
+        "/export:HidP_GetUsages",
+        "/export:HidP_GetUsagesEx",
+        "/export:HidP_GetValueCaps",
+        "/export:HidP_InitializeReportForID",
+        "/export:HidP_MaxDataListLength",
+        "/export:HidP_MaxUsageListLength",
+        "/export:HidP_SetData",
+        "/export:HidP_SetScaledUsageValue",
+        "/export:HidP_SetUsageValue",
+        "/export:HidP_SetUsageValueArray",
+        "/export:HidP_SetUsages",
+        "/export:HidP_TranslateUsagesToI8042ScanCodes",
+        "/export:HidP_UnsetUsages",
+        "/export:HidP_UsageListDifference",
     ]
     print("[3/3] lld-link")
     subprocess.run(cmd, check=True)

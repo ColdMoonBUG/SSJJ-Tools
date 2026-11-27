@@ -2,7 +2,7 @@
 
 面向《生死狙击》（4399 / Wooduan 微端）的绿色免安装桌面工具箱，**核心主打武器皮肤与建模本地替换**，并附带可选的大厅资源本地加速、帧率设置与常用维护工具。
 
-> **直接下载绿色免安装版**：前往 [Releases (v1.1)](https://github.com/ColdMoonBUG/-/releases/tag/v1.1) 下载 `ssjj-toolbox-v1.1.zip`，解压后双击 `生死狙击工具箱.exe` 即可运行，无需安装 Python 或 .NET 环境。
+> **当前本地便携包**：`release/生死工具箱1.2.0.zip`。解压后双击 `生死狙击工具箱.exe` 即可运行，无需安装 Python 或 .NET 环境。单文件修正版见 `release/生死狙击工具箱-1.2.0-修正版.exe`。
 
 ---
 
@@ -66,14 +66,14 @@ build_exe.py           PyInstaller 单文件与绿色便携包打包脚本
 
 ## 从源码打包
 
-环境要求：Windows 10/11 x64、Python 3.12（安装 `PySide6`、`psutil`、`cryptography`、`pyinstaller`）。
+环境要求：Windows 10/11 x64、Python 3.12（安装 `PySide6`、`psutil`、`cryptography`、`pyinstaller`、`UnityPy`、`Pillow`）。
 
 ```bash
 # 仅打包到 dist\
 python build_exe.py
 
-# 打包并部署到根目录 + 生成 release\ 绿色压缩包
-python build_exe.py --deploy --release
+# 生成 release\生死工具箱<当前版本>.zip
+python build_exe.py --release
 ```
 
 ---

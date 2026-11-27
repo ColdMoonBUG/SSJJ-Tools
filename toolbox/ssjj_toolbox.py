@@ -192,7 +192,7 @@ $me = [int]$env:SSJJ_TOOLBOX_CLEANUP_ME
 $parent = [int]$env:SSJJ_TOOLBOX_CLEANUP_PARENT
 Get-CimInstance Win32_Process | Where-Object {
     $_.ProcessId -ne $me -and $_.ProcessId -ne $parent -and
-    $_.Name -match '^(生死狙击工具箱|生死工具箱)' -and
+    $_.Name -match '^(生死狙击工具箱|生死工具箱|SSJJ-Toolbox)' -and
     $_.Name.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase) -and
     (-not $_.CommandLine -or $_.CommandLine -notmatch '--accel-daemon|--risk-inject')
 } | ForEach-Object {

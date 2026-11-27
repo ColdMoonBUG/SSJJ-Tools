@@ -25,6 +25,7 @@ namespace SsjjRisk
             public string Src;
             public string Model;
             public string Skin;
+            public string SkinName;
             public bool Enabled;
         }
 
@@ -80,7 +81,12 @@ namespace SsjjRisk
         private static bool _skinMapResolvedWithFactory;
         private static DateTime _lastMtime = DateTime.MinValue;
         private static volatile bool _globalEnabled = true;
+        private static volatile bool _selfOnly = true;
+        private static volatile bool _killFeedSim = true;
         private static List<SwapRule> _rules = new List<SwapRule>();
+
+        public static bool SelfOnly { get { return _selfOnly; } }
+        public static bool KillFeedSimEnabled { get { return _globalEnabled && _killFeedSim; } }
 
         // 供原生 IL Hook 无锁读取的不可变字典引用
         private static volatile Dictionary<string, string> _activeSkins =
@@ -88,6 +94,25 @@ namespace SsjjRisk
 
         private static volatile Dictionary<string, string> _activeModels =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        // self_only=true 时供本地玩家独享的 WeaponInfo 克隆副本（不改全局 WeaponInfoFactory）
+        private static volatile Dictionary<string, object> _localWeaponInfoClones =
+            new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly Dictionary<string, string> _appliedLocalClones =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly MethodInfo _memberwiseCloneMethod =
+            typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        // 本地玩家 ID / 组件归属反射缓存
+        private static bool _localIdResolved;
+        private static Func<int> _getLocalPlayerIdDel;
+        private static bool _localCompResolved;
+        private static PropertyInfo _pContextsShared;
+        private static PropertyInfo _pPlayerCtx;
+        private static PropertyInfo _pMyPlayerEntity;
+        private static PropertyInfo _pMyCurrentWeapon;
 
         // 防止 DynamicMethod 委托被 GC 回收（被 Inline Hook 直接跳入其 JIT 代码地址）
         private static readonly List<Delegate> _pinnedDelegates = new List<Delegate>();
@@ -195,6 +220,10 @@ namespace SsjjRisk
                             _activeSkins = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                         if (_activeModels.Count > 0)
                             _activeModels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        if (_localWeaponInfoClones.Count > 0)
+                            _localWeaponInfoClones = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                        if (_appliedLocalClones.Count > 0)
+                            _appliedLocalClones.Clear();
                         if (_appliedModels.Count > 0)
                             RestoreAllModels();
                     }
@@ -215,13 +244,80 @@ namespace SsjjRisk
                             Thread.Sleep(500);
                             continue;
                         }
-                        Loader.Log("[skin] 建模补查到期：已应用 " + _appliedModels.Count +
+                        int appliedCount = _selfOnly ? _appliedLocalClones.Count : _appliedModels.Count;
+                        Loader.Log("[skin] 建模补查到期：已应用 " + appliedCount +
                                    "/" + desired.Count + " 条；未就绪条目本局不再重试");
                     }
                     Loader.Log("[skin] 冷加载完成，后台线程退出（进程内不再有本工具常驻线程）");
                     return;
                 }
                 Thread.Sleep(hot ? 500 : 2000);
+            }
+        }
+
+        /// <summary>获取当前本地玩家实体 ID（通过 UiIEventCondition.Get_uiMyPlayer_PlayerId，带安全兜底）。</summary>
+        public static int GetLocalPlayerId()
+        {
+            try
+            {
+                Func<int> del = _getLocalPlayerIdDel;
+                if (del == null && !_localIdResolved)
+                {
+                    Type uiCond = FindType("Assets.Sources.Modules.Ui.UiEventCondition.UiIEventCondition");
+                    if (uiCond != null)
+                    {
+                        MethodInfo m = uiCond.GetMethod("Get_uiMyPlayer_PlayerId", BindingFlags.Public | BindingFlags.Static);
+                        if (m != null && m.ReturnType == typeof(int) && m.GetParameters().Length == 0)
+                        {
+                            del = (Func<int>)Delegate.CreateDelegate(typeof(Func<int>), m);
+                            _getLocalPlayerIdDel = del;
+                        }
+                        _localIdResolved = true;
+                    }
+                }
+                if (del != null) return del();
+            }
+            catch { }
+            return -1;
+        }
+
+        /// <summary>判断 CurrentWeaponComponent 是否归属本地玩家（无法确定时保守返回 true，避免切枪过渡帧失效）。</summary>
+        private static bool IsLocalPlayerComponent(object comp)
+        {
+            if (comp == null) return true;
+            try
+            {
+                if (!_localCompResolved)
+                {
+                    Type tCtx = FindType("Contexts");
+                    if (tCtx != null)
+                    {
+                        _pContextsShared = tCtx.GetProperty("sharedInstance", All);
+                        _pPlayerCtx = tCtx.GetProperty("player", All);
+                        if (_pPlayerCtx != null)
+                        {
+                            _pMyPlayerEntity = _pPlayerCtx.PropertyType.GetProperty("myPlayerEntity", All);
+                            if (_pMyPlayerEntity != null)
+                                _pMyCurrentWeapon = _pMyPlayerEntity.PropertyType.GetProperty("currentWeapon", All);
+                        }
+                        _localCompResolved = true;
+                    }
+                }
+                if (_pContextsShared == null || _pPlayerCtx == null || _pMyPlayerEntity == null || _pMyCurrentWeapon == null)
+                    return true;
+                object ctx = _pContextsShared.GetValue(null, null);
+                if (ctx == null) return true;
+                object playerCtx = _pPlayerCtx.GetValue(ctx, null);
+                if (playerCtx == null) return true;
+                object myPlayer = _pMyPlayerEntity.GetValue(playerCtx, null);
+                if (myPlayer == null) return true;
+                object myComp = _pMyCurrentWeapon.GetValue(myPlayer, null);
+                if (myComp == null) return true;
+                return ReferenceEquals(comp, myComp);
+            }
+            catch
+            {
+                return true;
             }
         }
 
@@ -235,6 +331,86 @@ namespace SsjjRisk
             if (map != null && map.TryGetValue(weaponName, out target) && !string.IsNullOrEmpty(target))
                 return target;
             return origSkin;
+        }
+
+        /// <summary>左下角通报使用规则中保存的皮肤中文名（含双阵营皮肤后缀）。</summary>
+        public static string ResolveSkinDisplayName(string skinCode)
+        {
+            if (string.IsNullOrEmpty(skinCode)) return "";
+            string baseCode = skinCode;
+            if (baseCode.EndsWith("_ct", StringComparison.OrdinalIgnoreCase))
+                baseCode = baseCode.Substring(0, baseCode.Length - 3);
+            else if (baseCode.EndsWith("_t", StringComparison.OrdinalIgnoreCase))
+                baseCode = baseCode.Substring(0, baseCode.Length - 2);
+            List<SwapRule> rules = _rules;
+            foreach (SwapRule rule in rules)
+            {
+                if (!rule.Enabled || string.IsNullOrEmpty(rule.SkinName) ||
+                    string.Equals(rule.SkinName, rule.Skin, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (string.Equals(skinCode, rule.Skin, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(baseCode, rule.Skin, StringComparison.OrdinalIgnoreCase))
+                    return rule.SkinName;
+            }
+            return "";
+        }
+
+        /// <summary>按 PlayerEntityData.Id 过滤的皮肤解析（self_only=true 时跳过其他玩家）。</summary>
+        public static string ResolveSkinForPlayer(int ownerId, string weaponName, string origSkin)
+        {
+            if (!_globalEnabled || string.IsNullOrEmpty(weaponName))
+                return origSkin;
+            if (_selfOnly)
+            {
+                int localId = GetLocalPlayerId();
+                if (localId > 0 && ownerId > 0 && ownerId != localId)
+                    return origSkin;
+            }
+            return ResolveSkin(weaponName, origSkin);
+        }
+
+        /// <summary>按 CurrentWeaponComponent 归属过滤的皮肤解析（self_only=true 时跳过其他玩家）。</summary>
+        public static string ResolveSkinForComponent(object comp, string weaponName, string origSkin)
+        {
+            if (!_globalEnabled || string.IsNullOrEmpty(weaponName))
+                return origSkin;
+            if (_selfOnly && !IsLocalPlayerComponent(comp))
+                return origSkin;
+            return ResolveSkin(weaponName, origSkin);
+        }
+
+        /// <summary>按 PlayerEntityData.Id 过滤的本地建模 WeaponInfo 副本解析。</summary>
+        public static object ResolveWeaponInfoForPlayer(int ownerId, string weaponName, object origWeaponInfo)
+        {
+            if (!_globalEnabled || !_selfOnly || string.IsNullOrEmpty(weaponName))
+                return origWeaponInfo;
+            int localId = GetLocalPlayerId();
+            if (localId > 0 && ownerId > 0 && ownerId != localId)
+                return origWeaponInfo;
+            return LookupLocalWeaponInfoClone(weaponName, origWeaponInfo);
+        }
+
+        /// <summary>按 CurrentWeaponComponent 归属过滤的本地建模 WeaponInfo 副本解析。</summary>
+        public static object ResolveWeaponInfoForComponent(object comp, string weaponName, object origWeaponInfo)
+        {
+            if (!_globalEnabled || !_selfOnly || string.IsNullOrEmpty(weaponName))
+                return origWeaponInfo;
+            if (!IsLocalPlayerComponent(comp))
+                return origWeaponInfo;
+            return LookupLocalWeaponInfoClone(weaponName, origWeaponInfo);
+        }
+
+        private static object LookupLocalWeaponInfoClone(string weaponName, object origWeaponInfo)
+        {
+            Dictionary<string, object> clones = _localWeaponInfoClones;
+            if (clones == null || clones.Count == 0) return origWeaponInfo;
+            object cloned;
+            if (clones.TryGetValue(weaponName, out cloned) && cloned != null)
+                return cloned;
+            string baseName = FactionBase(weaponName);
+            if (baseName != weaponName && clones.TryGetValue(baseName, out cloned) && cloned != null)
+                return cloned;
+            return origWeaponInfo;
         }
 
         /// <summary>供开镜准星与武器音效 Hook 调用：将原武器名映射为目标建模武器名（零锁零日志）。</summary>
@@ -418,6 +594,23 @@ namespace SsjjRisk
                 Loader.Log("[skin] 开镜准星 IL Hook 失败: " + ex.Message);
             }
 
+            // 1.5 切枪 150ms 开镜闪屏去抖：Hook UiIEventCondition.Get_uiCross_AwpVisible()
+            try
+            {
+                Type uiCond = FindType("Assets.Sources.Modules.Ui.UiEventCondition.UiIEventCondition");
+                MethodInfo mAwpVis = uiCond != null ? uiCond.GetMethod("Get_uiCross_AwpVisible", BindingFlags.Public | BindingFlags.Static) : null;
+                if (mAwpVis != null && mAwpVis.ReturnType == typeof(bool) && mAwpVis.GetParameters().Length == 0)
+                {
+                    IntPtr ptr = BuildAwpVisibleIL();
+                    if (ptr != IntPtr.Zero && InstallJumpHookPtr(mAwpVis, ptr))
+                        Loader.Log("[skin] Hook 已写入: UiIEventCondition.Get_uiCross_AwpVisible (切枪 150ms 开镜闪屏去抖)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Loader.Log("[skin] 开镜去抖 Hook 失败: " + ex.Message);
+            }
+
             // 2. 武器音效（开火/切枪/换弹）：Hook SoundResourceUtility.GetWeaponSoundAssetInfo(string, string)
             try
             {
@@ -434,6 +627,83 @@ namespace SsjjRisk
             {
                 Loader.Log("[skin] 武器音效 IL Hook 失败: " + ex.Message);
             }
+        }
+
+        private static long _awpTrueSinceTick;
+
+        public static bool FilterAwpCrossVisible(bool rawVisible)
+        {
+            if (!rawVisible)
+            {
+                _awpTrueSinceTick = 0;
+                return false;
+            }
+            if (!InspectPlayback.IsInRaiseGuardWindow(600))
+            {
+                _awpTrueSinceTick = 0;
+                return true;
+            }
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long since = _awpTrueSinceTick;
+            if (since <= 0)
+            {
+                _awpTrueSinceTick = now;
+                return false;
+            }
+            long heldMs = (now - since) * 1000 / System.Diagnostics.Stopwatch.Frequency;
+            return heldMs >= 150;
+        }
+
+        private static IntPtr BuildAwpVisibleIL()
+        {
+            Type tCtx = FindType("Contexts");
+            if (tCtx == null) return IntPtr.Zero;
+            PropertyInfo pShared = tCtx.GetProperty("sharedInstance", All);
+            FieldInfo fShared = pShared == null ? tCtx.GetField("sharedInstance", All) : null;
+            if (pShared == null && fShared == null) return IntPtr.Zero;
+
+            Type tCross = MemberType(tCtx, "cross");
+            if (tCross == null || MemberType(tCross, "isAwpCross") != typeof(bool))
+                return IntPtr.Zero;
+
+            MethodInfo mFilter = typeof(WeaponSwapper).GetMethod(
+                nameof(FilterAwpCrossVisible), BindingFlags.Public | BindingFlags.Static);
+            if (mFilter == null) return IntPtr.Zero;
+
+            DynamicMethod dm = new DynamicMethod(
+                "SsjjCrossAwpVisible", typeof(bool), Type.EmptyTypes,
+                typeof(WeaponSwapper).Module, true);
+            ILGenerator il = dm.GetILGenerator();
+            Label lblFalse = il.DefineLabel();
+            LocalBuilder locCtx = il.DeclareLocal(tCtx);
+            LocalBuilder locCross = il.DeclareLocal(tCross);
+
+            if (pShared != null) il.Emit(OpCodes.Call, pShared.GetGetMethod(true));
+            else il.Emit(OpCodes.Ldsfld, fShared);
+            il.Emit(OpCodes.Stloc, locCtx);
+            il.Emit(OpCodes.Ldloc, locCtx);
+            il.Emit(OpCodes.Brfalse, lblFalse);
+
+            il.Emit(OpCodes.Ldloc, locCtx);
+            EmitGet(il, tCtx, "cross");
+            il.Emit(OpCodes.Stloc, locCross);
+            il.Emit(OpCodes.Ldloc, locCross);
+            il.Emit(OpCodes.Brfalse, lblFalse);
+
+            il.Emit(OpCodes.Ldloc, locCross);
+            EmitGet(il, tCross, "isAwpCross");
+            il.Emit(OpCodes.Call, mFilter);
+            il.Emit(OpCodes.Ret);
+
+            il.MarkLabel(lblFalse);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Call, mFilter);
+            il.Emit(OpCodes.Ret);
+
+            Delegate del = dm.CreateDelegate(typeof(Func<bool>));
+            _pinnedDelegates.Add(del);
+            RuntimeHelpers.PrepareMethod(del.Method.MethodHandle);
+            return del.Method.MethodHandle.GetFunctionPointer();
         }
 
         private static void TryInstallVisualHooks()
@@ -486,7 +756,7 @@ namespace SsjjRisk
                 {
                     IntPtr ptr = InspectPlayback.Build(play);
                     if (ptr != IntPtr.Zero && InstallJumpHookPtr(play, ptr))
-                        Loader.Log("[skin] 已安装本地长检视播放 Hook");
+                        Loader.Log("[skin] Hook 已写入: ViewAnimSystem.PlayHandAnimation (本地长检视 + 切枪原速方案B)");
                     else
                         Loader.Log("[skin] 长检视接口不匹配，本局保留原动画");
                 }
@@ -530,6 +800,95 @@ namespace SsjjRisk
             {
                 Loader.Log("[skin] 武器专属 UI Hook 失败: " + ex.GetType().Name + " " + ex.Message);
             }
+
+            // 特效皮肤（HasEffect=true）的 AssetBundle 路径在 WeaponSkinInfo.SetWeaponName(ref string)
+            // 里按 weaponInfo.Name 拼接；跨武器换模时 weaponInfo.Name 仍保留原武器名，若不映射到目标建模名
+            // 会错误回退到 WeaponList[0]（例如 skin_awm_legend_porcelain_t 回退成 awm_legend），导致模型与动画全空。
+            try
+            {
+                Type skinInfoType = FindType("Assets.Sources.Info.Weapon.WeaponSkinInfo");
+                MethodInfo mSetWeaponName = skinInfoType == null ? null :
+                    skinInfoType.GetMethod("SetWeaponName", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance,
+                                           null, new[] { typeof(string).MakeByRefType() }, null);
+                if (mSetWeaponName != null && mSetWeaponName.ReturnType == typeof(void))
+                {
+                    _fSkinWeaponList = skinInfoType.GetField("WeaponList", All);
+                    _fSkinWeapon = skinInfoType.GetField("Weapon", All);
+                    DynamicMethod dm = new DynamicMethod("SsjjSkinSetWeaponName",
+                        typeof(void), new[] { typeof(object), typeof(string).MakeByRefType() },
+                        typeof(WeaponSwapper).Module, true);
+                    ILGenerator il = dm.GetILGenerator();
+                    il.Emit(OpCodes.Ldarg_0);
+                    il.Emit(OpCodes.Ldarg_1);
+                    il.Emit(OpCodes.Call, typeof(WeaponSwapper).GetMethod(nameof(OnSetSkinWeaponName), BindingFlags.Public | BindingFlags.Static));
+                    il.Emit(OpCodes.Ret);
+                    Delegate del = dm.CreateDelegate(typeof(SetWeaponNameDelegate));
+                    _pinnedDelegates.Add(del);
+                    RuntimeHelpers.PrepareMethod(del.Method.MethodHandle);
+                    if (InstallJumpHookPtr(mSetWeaponName, del.Method.MethodHandle.GetFunctionPointer()))
+                        Loader.Log("[skin] Hook 已写入: WeaponSkinInfo.SetWeaponName");
+                }
+                else
+                {
+                    Loader.Log("[skin] WeaponSkinInfo.SetWeaponName 未匹配: type=" + (skinInfoType != null) +
+                               " method=" + (mSetWeaponName != null));
+                }
+            }
+            catch (Exception ex)
+            {
+                Loader.Log("[skin] WeaponSkinInfo.SetWeaponName Hook 失败: " + ex.GetType().Name + " " + ex.Message);
+            }
+        }
+
+        private delegate void SetWeaponNameDelegate(object skinInfo, ref string weaponName);
+        private static FieldInfo _fSkinWeaponList;
+        private static FieldInfo _fSkinWeapon;
+
+        public static void OnSetSkinWeaponName(object skinInfo, ref string weaponName)
+        {
+            if (skinInfo == null) return;
+            try
+            {
+                List<string> weaponList = _fSkinWeaponList != null ? _fSkinWeaponList.GetValue(skinInfo) as List<string> : null;
+                if (weaponList == null && _fSkinWeapon != null)
+                {
+                    string raw = _fSkinWeapon.GetValue(skinInfo) as string;
+                    if (!string.IsNullOrEmpty(raw))
+                    {
+                        weaponList = new List<string>(raw.Split(':'));
+                        if (_fSkinWeaponList != null) _fSkinWeaponList.SetValue(skinInfo, weaponList);
+                    }
+                }
+                if (weaponList == null || weaponList.Count == 0) return;
+
+                if (!string.IsNullOrEmpty(weaponName))
+                {
+                    string mapped = ResolveModelWeapon(weaponName);
+                    if (!string.IsNullOrEmpty(mapped) &&
+                        !string.Equals(mapped, weaponName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (weaponList.Contains(mapped))
+                        {
+                            weaponName = mapped;
+                        }
+                        else
+                        {
+                            for (int i = 0; i < weaponList.Count; i++)
+                            {
+                                if (string.Equals(weaponList[i], mapped, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    weaponName = weaponList[i];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!weaponList.Contains(weaponName))
+                    weaponName = weaponList[0];
+            }
+            catch { }
         }
 
         public static bool IsVisualHoldWeapon(string actual, string requested)
@@ -940,6 +1299,9 @@ namespace SsjjRisk
             FieldInfo fInst = tFactory != null ? tFactory.GetField("Instance", All) : null;
             MethodInfo mGetInfo = tFactory != null ? tFactory.GetMethod("GetWeaponInfo", new[] { typeof(string) }) : null;
             MethodInfo mResolve = typeof(WeaponSwapper).GetMethod(nameof(ResolveSkin), BindingFlags.Public | BindingFlags.Static);
+            MethodInfo mResolveForPlayer = typeof(WeaponSwapper).GetMethod(nameof(ResolveSkinForPlayer), BindingFlags.Public | BindingFlags.Static);
+            MethodInfo mResolveWiForPlayer = typeof(WeaponSwapper).GetMethod(nameof(ResolveWeaponInfoForPlayer), BindingFlags.Public | BindingFlags.Static);
+            bool hasOwnerId = MemberType(tPd, "Id") == typeof(int);
 
             DynamicMethod dm = new DynamicMethod(
                 "SsjjCopyFromPD", typeof(void), new[] { tComp, tPd }, typeof(WeaponSwapper).Module, true);
@@ -967,29 +1329,55 @@ namespace SsjjRisk
 
             EmitCopyDirect(il, tComp, "Level", tPd, "CurrentWeaponLevel", false, null);
 
-            // comp.SkinName = WeaponSwapper.ResolveSkin(wname, pd.CurrentWeaponSkinName)
+            // comp.SkinName = ResolveSkinForPlayer(pd.Id, wname, pd.CurrentWeaponSkinName)
             if (MemberType(tComp, "SkinName") != null && MemberType(tPd, "CurrentWeaponSkinName") != null)
             {
                 il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Ldloc, locName);
-                il.Emit(OpCodes.Ldarg_1);
-                EmitGet(il, tPd, "CurrentWeaponSkinName");
-                il.Emit(OpCodes.Call, mResolve);
+                if (hasOwnerId && mResolveForPlayer != null)
+                {
+                    il.Emit(OpCodes.Ldarg_1);
+                    EmitGet(il, tPd, "Id");
+                    il.Emit(OpCodes.Ldloc, locName);
+                    il.Emit(OpCodes.Ldarg_1);
+                    EmitGet(il, tPd, "CurrentWeaponSkinName");
+                    il.Emit(OpCodes.Call, mResolveForPlayer);
+                }
+                else
+                {
+                    il.Emit(OpCodes.Ldloc, locName);
+                    il.Emit(OpCodes.Ldarg_1);
+                    EmitGet(il, tPd, "CurrentWeaponSkinName");
+                    il.Emit(OpCodes.Call, mResolve);
+                }
                 EmitSet(il, tComp, "SkinName");
             }
 
             EmitCopyDirect(il, tComp, "Worn", tPd, "CurrentWeaponWorn", false, null);
             EmitCopyDirect(il, tComp, "QuenchId", tPd, "CurrentWeaponQuenchId", false, null);
 
-            // comp.WeaponInfo = (IEntitsWeaponInfo)WeaponInfoFactory.Instance.GetWeaponInfo(wname)
+            // comp.WeaponInfo = (IEntitsWeaponInfo)ResolveWeaponInfoForPlayer(pd.Id, wname, WeaponInfoFactory.Instance.GetWeaponInfo(wname))
             if (fInst != null && mGetInfo != null && MemberType(tComp, "WeaponInfo") != null)
             {
-                il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Ldsfld, fInst);
-                il.Emit(OpCodes.Ldloc, locName);
-                il.Emit(OpCodes.Callvirt, mGetInfo);
                 Type wiType = MemberType(tComp, "WeaponInfo");
-                EmitConvert(il, mGetInfo.ReturnType, wiType);
+                il.Emit(OpCodes.Ldarg_0);
+                if (hasOwnerId && mResolveWiForPlayer != null)
+                {
+                    il.Emit(OpCodes.Ldarg_1);
+                    EmitGet(il, tPd, "Id");
+                    il.Emit(OpCodes.Ldloc, locName);
+                    il.Emit(OpCodes.Ldsfld, fInst);
+                    il.Emit(OpCodes.Ldloc, locName);
+                    il.Emit(OpCodes.Callvirt, mGetInfo);
+                    il.Emit(OpCodes.Call, mResolveWiForPlayer);
+                    EmitConvert(il, typeof(object), wiType);
+                }
+                else
+                {
+                    il.Emit(OpCodes.Ldsfld, fInst);
+                    il.Emit(OpCodes.Ldloc, locName);
+                    il.Emit(OpCodes.Callvirt, mGetInfo);
+                    EmitConvert(il, mGetInfo.ReturnType, wiType);
+                }
                 EmitSet(il, tComp, "WeaponInfo");
             }
 
@@ -1007,7 +1395,8 @@ namespace SsjjRisk
             Type tRouge = MemberType(tWe, "rouge");
             Type tBi = MemberType(tWe, "basicInfo");
             Type tData = MemberType(tBi, "Data");
-            MethodInfo mResolve = typeof(WeaponSwapper).GetMethod(nameof(ResolveSkin), BindingFlags.Public | BindingFlags.Static);
+            MethodInfo mResolveForComp = typeof(WeaponSwapper).GetMethod(nameof(ResolveSkinForComponent), BindingFlags.Public | BindingFlags.Static);
+            MethodInfo mResolveWiForComp = typeof(WeaponSwapper).GetMethod(nameof(ResolveWeaponInfoForComponent), BindingFlags.Public | BindingFlags.Static);
 
             DynamicMethod dm = new DynamicMethod(
                 "SsjjCopyFromWE", typeof(void), new[] { tComp, tWe }, typeof(WeaponSwapper).Module, true);
@@ -1081,25 +1470,40 @@ namespace SsjjRisk
 
             EmitCopyDirect(il, tComp, "Level", tData, "Level", true, locData);
 
-            // comp.WeaponInfo = weaponEntity.basicInfo.Info
+            // comp.WeaponInfo = (IEntitsWeaponInfo)ResolveWeaponInfoForComponent(comp, wname, weaponEntity.basicInfo.Info)
             if (tBi != null && MemberType(tBi, "Info") != null && MemberType(tComp, "WeaponInfo") != null)
             {
+                Type wiType = MemberType(tComp, "WeaponInfo");
                 il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Ldarg_1);
-                EmitGet(il, tWe, "basicInfo");
-                EmitGet(il, tBi, "Info");
-                EmitConvert(il, MemberType(tBi, "Info"), MemberType(tComp, "WeaponInfo"));
+                if (mResolveWiForComp != null)
+                {
+                    il.Emit(OpCodes.Ldarg_0);
+                    il.Emit(OpCodes.Ldloc, locName);
+                    il.Emit(OpCodes.Ldarg_1);
+                    EmitGet(il, tWe, "basicInfo");
+                    EmitGet(il, tBi, "Info");
+                    il.Emit(OpCodes.Call, mResolveWiForComp);
+                    EmitConvert(il, typeof(object), wiType);
+                }
+                else
+                {
+                    il.Emit(OpCodes.Ldarg_1);
+                    EmitGet(il, tWe, "basicInfo");
+                    EmitGet(il, tBi, "Info");
+                    EmitConvert(il, MemberType(tBi, "Info"), wiType);
+                }
                 EmitSet(il, tComp, "WeaponInfo");
             }
 
-            // skin = WeaponSwapper.ResolveSkin(wname, data.WeaponSkinName)
+            // skin = WeaponSwapper.ResolveSkinForComponent(comp, wname, data.WeaponSkinName)
             // 同时写入 comp.SkinName 与 data.WeaponSkinName（确保屠魔素玉标记特效/地面/背枪/UI 同步生效）
             if (MemberType(tComp, "SkinName") != null && MemberType(tData, "WeaponSkinName") != null)
             {
+                il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldloc, locName);
                 il.Emit(OpCodes.Ldloc, locData);
                 EmitGet(il, tData, "WeaponSkinName");
-                il.Emit(OpCodes.Call, mResolve);
+                il.Emit(OpCodes.Call, mResolveForComp);
                 il.Emit(OpCodes.Stloc, locSkin);
 
                 il.Emit(OpCodes.Ldarg_0);
@@ -1128,6 +1532,7 @@ namespace SsjjRisk
         public static int UninstallHooks()
         {
             int n = 0;
+            _awpTrueSinceTick = 0;
             InspectPlayback.Reset();
             lock (_hookLock)
             {
@@ -1152,6 +1557,8 @@ namespace SsjjRisk
             }
             _hooksInstalled = false;
             _stopped = true;   // Loop() 下一轮直接返回，不再回写配置
+            _localWeaponInfoClones = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            _appliedLocalClones.Clear();
             Loader.Log("[skin] 已还原 " + n + " 个方法入口（detour 全部撤销）");
             return n;
         }
@@ -1228,6 +1635,14 @@ namespace SsjjRisk
             Match mEn = Regex.Match(raw, "\"enabled\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
             if (mEn.Success) en = mEn.Groups[1].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
 
+            bool selfOnly = true;
+            Match mSelf = Regex.Match(raw, "\"self_only\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
+            if (mSelf.Success) selfOnly = mSelf.Groups[1].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
+
+            bool killFeedSim = true;
+            Match mKf = Regex.Match(raw, "\"killfeed_sim\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
+            if (mKf.Success) killFeedSim = mKf.Groups[1].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
+
             List<SwapRule> parsed = new List<SwapRule>();
             int idx = raw.IndexOf("\"rules\"", StringComparison.OrdinalIgnoreCase);
             if (idx >= 0)
@@ -1239,6 +1654,7 @@ namespace SsjjRisk
                     string src = ExtractStr(obj, "src");
                     string model = ExtractStr(obj, "model");
                     string skin = ExtractStr(obj, "skin");
+                    string skinName = ExtractStr(obj, "skin_name");
                     bool rEn = true;
                     Match mREn = Regex.Match(obj, "\"enabled\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
                     if (mREn.Success) rEn = mREn.Groups[1].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
@@ -1249,14 +1665,19 @@ namespace SsjjRisk
                             Src = src.Trim(),
                             Model = (model ?? "").Trim(),
                             Skin = (skin ?? "").Trim(),
+                            SkinName = (skinName ?? "").Trim(),
                             Enabled = rEn
                         });
                     }
                 }
             }
             _globalEnabled = en;
+            _selfOnly = selfOnly;
+            _killFeedSim = killFeedSim;
             _rules = parsed;
-            Loader.Log("[skin] 热加载配置: enabled=" + _globalEnabled + " rules=" + _rules.Count);
+            Loader.Log("[skin] 热加载配置: enabled=" + _globalEnabled +
+                       " self_only=" + _selfOnly + " killfeed_sim=" + _killFeedSim +
+                       " rules=" + _rules.Count);
             return true;
         }
 
@@ -1353,7 +1774,15 @@ namespace SsjjRisk
                 }
                 else
                 {
-                    next[src] = skin;
+                    string baseSkin = skin;
+                    if (!string.IsNullOrEmpty(r.Model))
+                    {
+                        if (r.Model.EndsWith("_ct", StringComparison.OrdinalIgnoreCase))
+                            baseSkin = ResolveFactionSkin(skinFactory, mGetSkin, skin, "_ct");
+                        else if (r.Model.EndsWith("_t", StringComparison.OrdinalIgnoreCase))
+                            baseSkin = ResolveFactionSkin(skinFactory, mGetSkin, skin, "_t");
+                    }
+                    next[src] = baseSkin;
                     // 若存在双阵营皮肤（如屠魔 awm_legend -> _ct / _t），自动同时绑定
                     string sCt = ResolveFactionSkin(skinFactory, mGetSkin, skin, "_ct");
                     string sT = ResolveFactionSkin(skinFactory, mGetSkin, skin, "_t");
@@ -1463,14 +1892,45 @@ namespace SsjjRisk
 
         private static bool AllModelsApplied(Dictionary<string, string> desired)
         {
+            Dictionary<string, string> table = _selfOnly ? _appliedLocalClones : _appliedModels;
             foreach (var kv in desired)
             {
                 string applied;
-                if (!_appliedModels.TryGetValue(kv.Key, out applied) ||
+                if (!table.TryGetValue(kv.Key, out applied) ||
                     !applied.Equals(kv.Value, StringComparison.OrdinalIgnoreCase))
                     return false;
             }
             return true;
+        }
+
+        private static object CloneWeaponInfoWithVisuals(object srcInfo, object dstInfo, out int copied)
+        {
+            copied = 0;
+            if (srcInfo == null || dstInfo == null || _memberwiseCloneMethod == null) return null;
+            try
+            {
+                object clone = _memberwiseCloneMethod.Invoke(srcInfo, null);
+                if (clone == null) return null;
+
+                foreach (string fn in VisualFields)
+                {
+                    FieldInfo sfi = FindFieldInHierarchy(clone.GetType(), fn);
+                    if (sfi == null) continue;
+                    FieldInfo dfi = FindFieldInHierarchy(dstInfo.GetType(), fn);
+                    if (dfi == null) continue;
+                    try
+                    {
+                        sfi.SetValue(clone, dfi.GetValue(dstInfo));
+                        copied++;
+                    }
+                    catch { }
+                }
+                return copied > 0 ? clone : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static FieldInfo FindFieldInHierarchy(Type t, string name)
@@ -1490,6 +1950,75 @@ namespace SsjjRisk
             if (factory == null) return;
 
             Dictionary<string, string> want = BuildModelMap();
+
+            if (_selfOnly)
+            {
+                // 切到仅自己模式时，先还原先前可能写入过的全局 WeaponInfo，确保其他玩家不受影响
+                if (_appliedModels.Count > 0)
+                    RestoreAllModels();
+
+                var nextClones = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                var prevClones = _localWeaponInfoClones;
+                bool anyAttempt = false;
+                bool anyCloneOk = false;
+
+                foreach (var kv in want)
+                {
+                    string src = kv.Key;
+                    string dst = kv.Value;
+
+                    string curDst;
+                    object existingClone;
+                    if (_appliedLocalClones.TryGetValue(src, out curDst) &&
+                        curDst.Equals(dst, StringComparison.OrdinalIgnoreCase) &&
+                        prevClones != null && prevClones.TryGetValue(src, out existingClone) &&
+                        existingClone != null)
+                    {
+                        nextClones[src] = existingClone;
+                        anyCloneOk = true;
+                        continue;
+                    }
+
+                    object srcInfo = CallGetWeaponInfo(factory, src);
+                    object dstInfo = CallGetWeaponInfo(factory, dst);
+                    if (srcInfo == null || dstInfo == null) continue;
+
+                    anyAttempt = true;
+                    int copied;
+                    object cloned = CloneWeaponInfoWithVisuals(srcInfo, dstInfo, out copied);
+                    if (cloned != null)
+                    {
+                        nextClones[src] = cloned;
+                        _appliedLocalClones[src] = dst;
+                        SyncShowGunAction(src, dst);
+                        anyCloneOk = true;
+                        Loader.Log("[skin] 本地玩家建模副本生效: " + src + " -> " + dst + " (字段=" + copied + "，仅自己可见)");
+                    }
+                }
+
+                // 清理已移除规则的 ShowGun 动作与缓存记录
+                foreach (string oldSrc in new List<string>(_appliedLocalClones.Keys))
+                {
+                    if (!want.ContainsKey(oldSrc))
+                    {
+                        RestoreShowGunAction(oldSrc);
+                        _appliedLocalClones.Remove(oldSrc);
+                    }
+                }
+
+                if (anyCloneOk || !anyAttempt)
+                {
+                    _localWeaponInfoClones = nextClones;
+                    return;
+                }
+
+                Loader.Log("[skin] 本地 WeaponInfo 克隆不可用，优雅回退至全局建模替换");
+            }
+            else if (_localWeaponInfoClones.Count > 0 || _appliedLocalClones.Count > 0)
+            {
+                _localWeaponInfoClones = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                _appliedLocalClones.Clear();
+            }
 
             List<string> toRestore = new List<string>();
             foreach (var kv in _appliedModels)

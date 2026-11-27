@@ -186,9 +186,10 @@ class Worker(QObject):
     progress = Signal(int, str)
     done = Signal(object)
 
-    def __init__(self, fn, parent=None):
+    def __init__(self, fn, parent=None, quiet=False):
         super().__init__(parent)
         self.fn = fn
+        self.quiet = bool(quiet)
         self._thread = None
 
     def start(self):
@@ -196,12 +197,13 @@ class Worker(QObject):
         self._thread.start()
 
     def _run(self):
-        try:
-            import diagnostics
-            diagnostics.record("后台任务开始 page=%s task=%s" % (
-                type(self.parent()).__name__, getattr(self.fn, "__name__", "?")))
-        except Exception:
-            pass
+        if not self.quiet:
+            try:
+                import diagnostics
+                diagnostics.record("后台任务开始 page=%s task=%s" % (
+                    type(self.parent()).__name__, getattr(self.fn, "__name__", "?")))
+            except Exception:
+                pass
         try:
             result = self.fn(self)
         except Exception as exc:  # noqa: BLE001
@@ -213,12 +215,13 @@ class Worker(QObject):
                 pass
             self.log.emit("[错误] %r" % (exc,))
             result = None
-        try:
-            import diagnostics
-            diagnostics.record("后台任务结束 page=%s task=%s" % (
-                type(self.parent()).__name__, getattr(self.fn, "__name__", "?")))
-        except Exception:
-            pass
+        if not self.quiet:
+            try:
+                import diagnostics
+                diagnostics.record("后台任务结束 page=%s task=%s" % (
+                    type(self.parent()).__name__, getattr(self.fn, "__name__", "?")))
+            except Exception:
+                pass
         self.done.emit(result)
 
 
@@ -232,14 +235,23 @@ class Page(QWidget):
         self.app = app
         self._workers = []
 
-    def run(self, fn, on_done=None, log=None, progress=None):
-        w = Worker(fn, self)
+    def run(self, fn, on_done=None, log=None, progress=None, quiet=False):
+        w = Worker(fn, self, quiet=quiet)
         if log is not None:
             w.log.connect(log)
         if progress is not None:
             w.progress.connect(progress)
         if on_done is not None:
             w.done.connect(on_done)
+
+        def _cleanup(_res, _w=w):
+            try:
+                self._workers.remove(_w)
+            except ValueError:
+                pass
+            _w.deleteLater()
+
+        w.done.connect(_cleanup)
         self._workers.append(w)
         w.start()
         return w

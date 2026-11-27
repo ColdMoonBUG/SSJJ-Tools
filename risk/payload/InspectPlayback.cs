@@ -36,8 +36,27 @@ namespace SsjjRisk
             internal object VisualView;
         }
 
+        private sealed class RaiseClock
+        {
+            internal object Animator;
+            internal string Weapon;
+            internal string Target;
+            internal int State;
+            internal int TargetDur;
+            internal int OrigDur;
+            internal int LastRemain;
+            internal long Started;
+            internal long LastWeaponCheck;
+            internal object IdleView;
+        }
+
         private static Clock _clock;
         private static AttackClock _attack;
+        private static RaiseClock _raise;
+        private static long _lastRaiseStartTick;
+        private static object _standView;
+        private static object _specialStandView;
+        private static Type _standViewType;
         private static object _secondLightView;
         private static Type _secondLightType;
         private static Type _contextsType;
@@ -47,8 +66,21 @@ namespace SsjjRisk
         {
             _clock = null;
             _attack = null;
+            _raise = null;
+            System.Threading.Interlocked.Exchange(ref _lastRaiseStartTick, 0);
+            _standView = null;
+            _specialStandView = null;
+            _standViewType = null;
             _secondLightView = null;
             _secondLightType = null;
+        }
+
+        internal static bool IsInRaiseGuardWindow(int windowMs)
+        {
+            long started = System.Threading.Interlocked.Read(ref _lastRaiseStartTick);
+            if (started <= 0 || windowMs <= 0) return false;
+            long elapsedMs = (Stopwatch.GetTimestamp() - started) * 1000 / Stopwatch.Frequency;
+            return elapsedMs >= 0 && elapsedMs < windowMs;
         }
 
         private static object Read(object value, string name)
@@ -62,14 +94,19 @@ namespace SsjjRisk
             return field == null ? null : field.GetValue(receiver);
         }
 
+        private static void EnsureContextsType()
+        {
+            if (_contextsType != null) return;
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                _contextsType = assembly.GetType("Contexts", false);
+                if (_contextsType != null) break;
+            }
+        }
+
         private static string CurrentWeapon()
         {
-            if (_contextsType == null)
-                foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    _contextsType = assembly.GetType("Contexts", false);
-                    if (_contextsType != null) break;
-                }
+            EnsureContextsType();
             object contexts = Read(_contextsType, "sharedInstance");
             object player = Read(Read(contexts, "player"), "myPlayerEntity");
             return Read(Read(Read(player, "currentWeapon"), "WeaponInfo"), "Name") as string;
@@ -77,6 +114,7 @@ namespace SsjjRisk
 
         private static bool IsLocalAnimator(object animator)
         {
+            EnsureContextsType();
             object contexts = Read(_contextsType, "sharedInstance");
             object player = Read(Read(contexts, "player"), "myPlayerEntity");
             object firstPerson = Read(player, "firstPersonUnityObjects");
@@ -89,13 +127,118 @@ namespace SsjjRisk
             return state == 20 || state == 29 || state == 30 || state == 31;
         }
 
+        private static bool IsRaiseState(int state)
+        {
+            // TORSO_RAISE = 16, TORSO_SPECIAL_RAISE = 47, TORSO_RAISE1 = 202
+            return state == 16 || state == 47 || state == 202;
+        }
+
+        private static object GetIdleView(object sampleView, int raiseState)
+        {
+            if (sampleView == null) return null;
+            Type vt = sampleView.GetType();
+            if (_standViewType != vt)
+            {
+                _standView = null;
+                _specialStandView = null;
+                _standViewType = vt;
+            }
+            bool special = (raiseState == 47);
+            object cached = special ? _specialStandView : _standView;
+            if (cached != null) return cached;
+            int idleId = special ? 39 : 13; // TORSO_SPECIAL_STAND = 39, TORSO_STAND = 13
+            try
+            {
+                object created = Activator.CreateInstance(vt, new object[] { idleId });
+                if (created != null)
+                {
+                    if (special) _specialStandView = created;
+                    else _standView = created;
+                    return created;
+                }
+            }
+            catch { }
+            return null;
+        }
+
         public static object Adjust(object animator, object view, int state, int remain,
                                     int duration, object animInfo,
-                                    ref int visualTime)
+                                    ref int visualTime, ref float visualSpeed)
         {
             try
             {
                 long now = Stopwatch.GetTimestamp();
+                if (IsRaiseState(state))
+                {
+                    if (!IsLocalAnimator(animator)) return view;
+                    _clock = null;
+                    _attack = null;
+                    RaiseClock raise = _raise;
+                    bool restart = raise == null ||
+                        !ReferenceEquals(raise.Animator, animator) ||
+                        raise.State != state || remain > raise.LastRemain + 80;
+                    if (restart)
+                    {
+                        System.Threading.Interlocked.Exchange(ref _lastRaiseStartTick, now);
+                        string name = CurrentWeapon();
+                        string target = WeaponSwapper.ResolveModelWeapon(name);
+                        if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(target) &&
+                            !string.Equals(target, name, StringComparison.OrdinalIgnoreCase) &&
+                            duration >= 100 && duration <= 6000 &&
+                            remain >= 100 && Math.Abs(remain - duration) > 10)
+                        {
+                            raise = new RaiseClock
+                            {
+                                Animator = animator, Weapon = name, Target = target,
+                                State = state, TargetDur = duration, OrigDur = remain,
+                                LastRemain = remain, Started = now, LastWeaponCheck = now,
+                                IdleView = GetIdleView(view, state)
+                            };
+                            _raise = raise;
+                            Loader.Log("[skin] 切枪动画原速方案B: " + name + "->" + target +
+                                       " 动作=" + state + " 原窗口=" + remain + "ms 目标动画=" + duration +
+                                       "ms (1.0x原速播完切待机)");
+                        }
+                        else
+                        {
+                            _raise = null;
+                            return view;
+                        }
+                    }
+                    if (now - raise.LastWeaponCheck >= Stopwatch.Frequency / 10)
+                    {
+                        if (!string.Equals(CurrentWeapon(), raise.Weapon,
+                                           StringComparison.OrdinalIgnoreCase))
+                        {
+                            _raise = null;
+                            return view;
+                        }
+                        raise.LastWeaponCheck = now;
+                    }
+                    if (remain > raise.OrigDur)
+                        raise.OrigDur = remain;
+                    long elapsedMs = (now - raise.Started) * 1000 / Stopwatch.Frequency;
+                    if (elapsedMs < 0) elapsedMs = 0;
+                    raise.LastRemain = remain;
+                    if (elapsedMs < raise.TargetDur)
+                    {
+                        // 阶段 1：严格 1.0x 原速从第 0 帧流畅播完目标建模切枪动画
+                        visualTime = (int)elapsedMs;
+                        visualSpeed = 1f;
+                        return view;
+                    }
+                    // 阶段 2：目标掏枪已播完，逻辑冷却剩余时间内平滑切入待机姿态（不改 NextAttackTimer）
+                    if (raise.IdleView != null)
+                    {
+                        visualTime = (int)(elapsedMs - raise.TargetDur);
+                        visualSpeed = 1f;
+                        return raise.IdleView;
+                    }
+                    visualTime = raise.TargetDur;
+                    visualSpeed = 0f;
+                    return view;
+                }
+                _raise = null;
                 if (IsKnifeAttack(state))
                 {
                     if (!IsLocalAnimator(animator)) return view;
@@ -234,6 +377,7 @@ namespace SsjjRisk
             {
                 _clock = null;
                 _attack = null;
+                _raise = null;
                 return view;
             }
         }
@@ -296,6 +440,7 @@ namespace SsjjRisk
             LocalBuilder isLoop = il.DeclareLocal(typeof(bool));
             LocalBuilder duration = il.DeclareLocal(typeof(int));
             LocalBuilder visualTime = il.DeclareLocal(typeof(int));
+            LocalBuilder visualSpeed = il.DeclareLocal(typeof(float));
             Label done = il.DefineLabel();
             Label computed = il.DefineLabel();
             Label nonzero = il.DefineLabel();
@@ -339,6 +484,8 @@ namespace SsjjRisk
             il.Emit(OpCodes.Ldarg_S, (byte)4);
             il.Emit(OpCodes.Ldind_I4);
             il.Emit(OpCodes.Stloc, visualTime);
+            il.Emit(OpCodes.Ldc_R4, 1f);
+            il.Emit(OpCodes.Stloc, visualSpeed);
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Ldarg_3);
             il.Emit(OpCodes.Ldarg_3);
@@ -348,6 +495,7 @@ namespace SsjjRisk
             il.Emit(OpCodes.Ldloc, duration);
             il.Emit(OpCodes.Ldarg_S, (byte)6);
             il.Emit(OpCodes.Ldloca_S, visualTime);
+            il.Emit(OpCodes.Ldloca_S, visualSpeed);
             il.Emit(OpCodes.Call, typeof(InspectPlayback).GetMethod("Adjust"));
             il.Emit(OpCodes.Castclass, view);
             il.Emit(OpCodes.Stloc, activeView);
@@ -355,8 +503,8 @@ namespace SsjjRisk
             il.Emit(OpCodes.Castclass, stateType);
             il.Emit(OpCodes.Callvirt, loop.GetGetMethod());
             il.Emit(OpCodes.Stloc, isLoop);
-            EmitPlay(il, 2, activeView, visualTime, isLoop, name.GetGetMethod(), play);
-            EmitPlay(il, 1, activeView, visualTime, isLoop, name.GetGetMethod(), play);
+            EmitPlay(il, 2, activeView, visualTime, visualSpeed, isLoop, name.GetGetMethod(), play);
+            EmitPlay(il, 1, activeView, visualTime, visualSpeed, isLoop, name.GetGetMethod(), play);
             il.MarkLabel(done);
             il.Emit(OpCodes.Ret);
 
@@ -394,7 +542,7 @@ namespace SsjjRisk
         }
 
         private static void EmitPlay(ILGenerator il, byte arg, LocalBuilder view,
-                                     LocalBuilder time, LocalBuilder loop,
+                                     LocalBuilder time, LocalBuilder speed, LocalBuilder loop,
                                      MethodInfo getName, MethodInfo play)
         {
             il.Emit(OpCodes.Ldarg_S, arg);
@@ -405,7 +553,7 @@ namespace SsjjRisk
             il.Emit(OpCodes.Conv_R4);
             il.Emit(OpCodes.Ldc_R4, 0.001f);
             il.Emit(OpCodes.Mul);
-            il.Emit(OpCodes.Ldc_R4, 1f);
+            il.Emit(OpCodes.Ldloc, speed);
             il.Emit(OpCodes.Ldloc, loop);
             il.Emit(OpCodes.Ldc_I4_0);
             il.Emit(OpCodes.Ldarg_S, (byte)7);

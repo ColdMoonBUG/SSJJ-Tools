@@ -23,6 +23,7 @@ class FpsPage(ScrollPage):
         super().__init__(app)
         self._busy_hall = False
         self._busy_game = False
+        self._busy_quality = False
         self._game = {}
 
         self.root.addWidget(page_header(
@@ -104,10 +105,12 @@ class FpsPage(ScrollPage):
         self.lb_gkey.setWordWrap(True)
         self.lb_glimit = QLabel("--")
         self.lb_gvsync = QLabel("--")
+        self.lb_gquality = QLabel("--")
         self.lb_grun = QLabel("--")
         for i, (k, v) in enumerate((("设置位置", self.lb_gkey),
                                     ("当前上限", self.lb_glimit),
                                     ("垂直同步", self.lb_gvsync),
+                                    ("当前画质", self.lb_gquality),
                                     ("客户端状态", self.lb_grun))):
             lab = QLabel(k)
             lab.setObjectName("Dim")
@@ -148,6 +151,27 @@ class FpsPage(ScrollPage):
             preset_row.addWidget(b)
         preset_row.addStretch(1)
         game.add_layout(preset_row)
+
+        quality_row = QHBoxLayout()
+        quality_row.setSpacing(8)
+        quality_row.addWidget(QLabel("战斗画质"))
+        self.cmb_quality = QComboBox()
+        for label in backend.GAME_QUALITY_PRESETS:
+            self.cmb_quality.addItem(label, label)
+        self.cmb_quality.setCurrentIndex(self.cmb_quality.findData("中等"))
+        self.cmb_quality.setMinimumWidth(110)
+        quality_row.addWidget(self.cmb_quality)
+        quality_row.addStretch(1)
+        self.btn_quality = QPushButton("应用画质")
+        self.btn_quality.setObjectName("Primary")
+        quality_row.addWidget(self.btn_quality)
+        game.add_layout(quality_row)
+        game.add(dim("极高：高贴图与完整特效；中等：中贴图与适中武器特效；"
+                     "最低：低贴图、极低特效、基础武器模型并关闭天空盒。"
+                     "不改变上方帧率设置和分辨率。", small=True))
+        self.lb_qmsg = dim("", small=True)
+        self.lb_qmsg.setWordWrap(True)
+        game.add(self.lb_qmsg)
 
         self.lb_gmsg = dim("", small=True)
         game.add(self.lb_gmsg)
@@ -213,6 +237,7 @@ class FpsPage(ScrollPage):
         self.btn_off.clicked.connect(self._off_hall)
         self.btn_restart.clicked.connect(self._restart)
         self.btn_gapply.clicked.connect(self._apply_game)
+        self.btn_quality.clicked.connect(self._apply_quality)
         self.btn_anim.clicked.connect(self._apply_anim)
         self.btn_anim_off.clicked.connect(self._off_anim)
 
@@ -257,6 +282,7 @@ class FpsPage(ScrollPage):
     def refresh(self):
         def job(_w):
             return {"hall": backend.fps_state(), "game": backend.game_fps_state(),
+                    "quality": backend.game_quality_state(),
                     "anim": backend.risk_lobby_inspect()}
 
         self.run(job, on_done=self._apply)
@@ -284,6 +310,7 @@ class FpsPage(ScrollPage):
         self.lb_renamed.setText("已改写，一次校验通过" if st.get("renamed") else "未改写")
 
         self._apply_game_state(d.get("game") or {})
+        self._apply_quality_state(d.get("quality") or {})
 
     def _apply_game_state(self, st):
         self._game = st or {}
@@ -307,6 +334,24 @@ class FpsPage(ScrollPage):
             self.badge_game.state("warn")
         self.btn_gapply.setEnabled(bool(found) and not running and not self._busy_game)
         self.spin_limit.setEnabled(bool(found))
+
+    def _apply_quality_state(self, st):
+        ready = st.get("found") and not st.get("missing") and not st.get("error")
+        if st.get("error"):
+            text = "读取失败：" + st["error"]
+        elif not st.get("found"):
+            text = "未生成设置"
+        elif st.get("missing"):
+            text = "缺少设置项：" + "、".join(st["missing"])
+        else:
+            text = st.get("preset") or "自定义"
+        self.lb_gquality.setText(text)
+        self.lb_gquality.setToolTip(text)
+        if st.get("preset") and not self._busy_quality:
+            self.cmb_quality.setCurrentIndex(self.cmb_quality.findData(st["preset"]))
+        self.cmb_quality.setEnabled(bool(ready) and not self._busy_quality)
+        self.btn_quality.setEnabled(bool(ready) and not st.get("running")
+                                    and not self._busy_quality)
 
     # ------------------------------------------------------------ 大厅动作
     def _set_hall_busy(self, busy):
@@ -380,6 +425,24 @@ class FpsPage(ScrollPage):
             self._busy_game = False
             ok, msg = res if res else (False, "写入失败")
             self.lb_gmsg.setText(msg)
+            self.refresh()
+
+        self.run(job, on_done=done)
+
+    def _apply_quality(self):
+        if self._busy_quality:
+            return
+        preset = self.cmb_quality.currentData()
+        self._busy_quality = True
+        self.btn_quality.setEnabled(False)
+
+        def job(_w):
+            return backend.game_quality_set(preset)
+
+        def done(res):
+            self._busy_quality = False
+            ok, msg = res if res else (False, "写入失败")
+            self.lb_qmsg.setText(msg)
             self.refresh()
 
         self.run(job, on_done=done)

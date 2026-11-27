@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-APP_VERSION = "1.1.11"
+APP_VERSION = "1.2.1"
 GITHUB_OWNER = "ColdMoonBUG"
 GITHUB_REPO = "SSJJ-Tools"
 RELEASES_API = "https://api.github.com/repos/%s/%s/releases/latest" % (GITHUB_OWNER, GITHUB_REPO)
@@ -24,6 +24,15 @@ UA = "SSJJ-Toolbox/%s" % APP_VERSION
 
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
+PYI_STRIP_ENV = (
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_PYI_SPLASH_IPC",
+    "_PYI_ARCHIVE_FILE",
+    "_MEIPASS",
+    "_MEIPASS2",
+)
+LAST_DOWNLOAD_META = {}
 
 # 国内 GitHub Release 加速镜像列表 + 官方直连兜底
 DOWNLOAD_MIRRORS = [
@@ -321,19 +330,35 @@ def check_update(timeout=12):
     return base
 
 
-def _writable_target_dir():
+def _resolve_target_dir():
+    """返回 (target_dir: Path, is_fallback_appdata: bool)。"""
     if getattr(sys, "frozen", False):
         cand = Path(sys.executable).resolve().parent
         try:
             probe = cand / ".ssjj_update_probe"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink()
-            return cand
+            return cand, False
         except Exception:
             pass
     local = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "ssjj-toolbox" / "updates"
     local.mkdir(parents=True, exist_ok=True)
-    return local
+    return local, True
+
+
+def _writable_target_dir():
+    target_dir, _fallback = _resolve_target_dir()
+    return target_dir
+
+
+def _clean_spawn_env():
+    """剥离 PyInstaller 单文件临时目录环境变量，防止拉起的新版 exe 误复用旧 _MEI 目录而静默崩溃。"""
+    env = os.environ.copy()
+    for k in list(env.keys()):
+        ku = k.upper()
+        if k in PYI_STRIP_ENV or ku.startswith("_PYI_") or ku.startswith("_MEIPASS"):
+            env.pop(k, None)
+    return env
 
 
 def _probe_single_mirror(name, url, timeout=4.0):
@@ -389,7 +414,8 @@ def probe_mirrors(candidates, timeout=4.0, cancel_event=None):
     return [(n, u) for _dt, _i, n, u in ok_list] + [(n, u) for _i, n, u in failed_list]
 
 
-def _emit_status(progress_cb, status_cb, got, total, speed=0.0, eta=-1.0, mirror="", stage="downloading"):
+def _emit_status(progress_cb, status_cb, got, total, speed=0.0, eta=-1.0,
+                 mirror="", stage="downloading", extra=None):
     if progress_cb:
         try:
             progress_cb(got, total)
@@ -397,16 +423,19 @@ def _emit_status(progress_cb, status_cb, got, total, speed=0.0, eta=-1.0, mirror
             pass
     if status_cb:
         pct = min(100, int(got * 100 / total)) if total > 0 else 0
+        payload = {
+            "pct": pct,
+            "got": int(got or 0),
+            "total": int(total or 0),
+            "speed": float(speed or 0.0),
+            "eta": float(eta if eta is not None else -1.0),
+            "mirror": str(mirror or ""),
+            "stage": str(stage or "downloading"),
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
         try:
-            status_cb({
-                "pct": pct,
-                "got": got,
-                "total": total,
-                "speed": float(speed),
-                "eta": float(eta),
-                "mirror": mirror,
-                "stage": stage,
-            })
+            status_cb(payload)
         except Exception:
             pass
 
@@ -507,43 +536,106 @@ def _verify_downloaded_exe(tmp_path, expected_size=0, expected_sha256=""):
 
 
 def _write_replace_script(staged_path, final_path, same_as_running):
-    """生成 UTF-8 BOM PowerShell 替换启动脚本：循环等待旧 PID 退出后再原子替换并启动新版。"""
+    """生成 UTF-8 BOM PowerShell 替换启动脚本：清理 _PYI_*，等待旧子/父 PID 退出，落盘日志并在失败时打开所在目录兜底。"""
     fd, ps1_path = tempfile.mkstemp(prefix="ssjj_update_", suffix=".ps1")
     os.close(fd)
     old_pid = os.getpid()
+    wait_pids = [old_pid]
+    if getattr(sys, "frozen", False):
+        try:
+            ppid = os.getppid()
+            if ppid and ppid != old_pid:
+                wait_pids.append(ppid)
+        except Exception:
+            pass
+
+    log_dir = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "ssjj-toolbox"
+    log_path = log_dir / "update_launch.log"
+    launch_path = final_path if same_as_running else staged_path
+    work_dir = str(Path(launch_path).resolve().parent)
 
     def _ps_quote(s):
         return "'" + str(s).replace("'", "''") + "'"
 
     staged_q = _ps_quote(staged_path)
     final_q = _ps_quote(final_path)
+    work_q = _ps_quote(work_dir)
+    log_dir_q = _ps_quote(log_dir)
+    log_q = _ps_quote(log_path)
+    pids_expr = "@(" + ", ".join(str(p) for p in wait_pids) + ")"
+
     lines = [
-        "$ErrorActionPreference = 'SilentlyContinue'",
-        "$oldPid = %d" % old_pid,
+        "Remove-Item Env:_PYI_* -ErrorAction SilentlyContinue",
+        "Remove-Item Env:_MEIPASS* -ErrorAction SilentlyContinue",
+        "$logDir = %s" % log_dir_q,
+        "$logFile = %s" % log_q,
+        "New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue | Out-Null",
+        "function Write-UpdLog([string]$msg) {",
+        "    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'",
+        "    try { Add-Content -LiteralPath $logFile -Value \"$ts  $msg\" -Encoding UTF8 } catch {}",
+        "}",
+        "$waitPids = %s" % pids_expr,
         "$staged = %s" % staged_q,
         "$target = %s" % final_q,
-        "for ($i = 0; $i -lt 30; $i++) {",
-        "    if (-not (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) { break }",
+        "$workDir = %s" % work_q,
+        "Write-UpdLog \"start same_as_running=%s waitPids=$($waitPids -join ',') staged=$staged target=$target\"" % (
+            "true" if same_as_running else "false"
+        ),
+        "for ($i = 0; $i -lt 60; $i++) {",
+        "    $alive = @()",
+        "    foreach ($pidItem in $waitPids) {",
+        "        if (Get-Process -Id $pidItem -ErrorAction SilentlyContinue) { $alive += $pidItem }",
+        "    }",
+        "    if ($alive.Count -eq 0) { break }",
         "    Start-Sleep -Milliseconds 500",
         "}",
+        "Write-UpdLog \"wait_done elapsed_ticks=$i\"",
     ]
     if same_as_running:
         lines += [
-            "for ($j = 0; $j -lt 10; $j++) {",
+            "$moved = $false",
+            "for ($j = 0; $j -lt 15; $j++) {",
             "    try {",
             "        Move-Item -LiteralPath $staged -Destination $target -Force -ErrorAction Stop",
+            "        $moved = $true",
+            "        Write-UpdLog \"move_ok attempt=$($j + 1)\"",
             "        break",
             "    } catch {",
+            "        Write-UpdLog \"move_retry attempt=$($j + 1) err=$($_.Exception.Message)\"",
             "        Start-Sleep -Milliseconds 300",
             "    }",
             "}",
-            "if (Test-Path -LiteralPath $target) { Start-Process -FilePath $target }",
+            "$launchExe = if ($moved -or (Test-Path -LiteralPath $target)) { $target } else { $staged }",
         ]
     else:
         lines += [
-            "if (Test-Path -LiteralPath $staged) { Start-Process -FilePath $staged }",
+            "$launchExe = $staged",
         ]
-    lines.append("Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue")
+    lines += [
+        "$launched = $false",
+        "if (Test-Path -LiteralPath $launchExe) {",
+        "    try {",
+        "        $p = Start-Process -FilePath $launchExe -WorkingDirectory $workDir -PassThru -ErrorAction Stop",
+        "        $launched = $true",
+        "        Write-UpdLog \"launch_ok pid=$($p.Id) exe=$launchExe\"",
+        "    } catch {",
+        "        Write-UpdLog \"launch_fail exe=$launchExe err=$($_.Exception.Message)\"",
+        "    }",
+        "} else {",
+        "    Write-UpdLog \"launch_missing exe=$launchExe\"",
+        "}",
+        "if (-not $launched) {",
+        "    try {",
+        "        if (Test-Path -LiteralPath $launchExe) {",
+        "            Start-Process -FilePath 'explorer.exe' -ArgumentList @(\"/select,$launchExe\") -ErrorAction SilentlyContinue",
+        "        } elseif (Test-Path -LiteralPath $workDir) {",
+        "            Start-Process -FilePath 'explorer.exe' -ArgumentList @($workDir) -ErrorAction SilentlyContinue",
+        "        }",
+        "        Write-UpdLog \"fallback_explorer_opened\"",
+        "    } catch {}",
+        "}",
+        "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue",
+    ]
     Path(ps1_path).write_text("\r\n".join(lines) + "\r\n", encoding="utf-8-sig")
     return ps1_path
 
@@ -558,6 +650,15 @@ def download_update(download_url, asset_name, expected_size=0, progress_cb=None,
         safe_name += ".exe"
 
     target_dir = _writable_target_dir()
+    is_fallback = False
+    if getattr(sys, "frozen", False):
+        try:
+            exe_parent = Path(sys.executable).resolve().parent
+            is_fallback = os.path.normcase(str(Path(target_dir).resolve())) != os.path.normcase(str(exe_parent))
+        except Exception:
+            is_fallback = False
+    else:
+        is_fallback = True
     tmp_path = target_dir / (safe_name + ".downloading")
     final_path = target_dir / safe_name
 
@@ -565,6 +666,7 @@ def download_update(download_url, asset_name, expected_size=0, progress_cb=None,
         getattr(sys, "frozen", False)
         and os.path.normcase(str(final_path)) == os.path.normcase(os.path.abspath(sys.executable))
     )
+    save_mode = "replace" if same_as_running else ("fallback_appdata" if is_fallback else "side_by_side")
     staged_path = (target_dir / (safe_name + ".new")) if same_as_running else final_path
 
     # 1. 构造候选镜像并并发测速排序
@@ -630,19 +732,36 @@ def download_update(download_url, asset_name, expected_size=0, progress_cb=None,
         return False, "下载失败（已尝试 %d 条线路）：%s" % (len(ordered), detail), "", ""
 
     final_sz = staged_path.stat().st_size if staged_path.is_file() else expected_size
-    _emit_status(progress_cb, status_cb, final_sz, expected_size or final_sz, 0.0, 0.0, used_mirror, "done")
-
     script_path = ""
     if getattr(sys, "frozen", False):
         cur_exe = os.path.abspath(sys.executable)
         script_path = _write_replace_script(staged_path, cur_exe if same_as_running else final_path, same_as_running)
 
-    return True, "新版已通过 %s 下载完成：%s" % (used_mirror, final_path), str(final_path), script_path
+    LAST_DOWNLOAD_META.clear()
+    LAST_DOWNLOAD_META.update({
+        "saved_path": str(final_path),
+        "save_mode": save_mode,
+        "mirror": used_mirror,
+        "script_path": script_path,
+    })
+    _emit_status(
+        progress_cb, status_cb, final_sz, expected_size or final_sz,
+        0.0, 0.0, used_mirror, "done",
+        extra={"saved_path": str(final_path), "save_mode": save_mode},
+    )
+
+    mode_desc = {
+        "replace": "重启后覆盖当前程序",
+        "side_by_side": "已保存到当前目录",
+        "fallback_appdata": "当前目录不可写，已保存到 AppData 更新目录",
+    }.get(save_mode, "已保存")
+    return True, "新版已通过 %s 下载完成（%s）：%s" % (used_mirror, mode_desc, final_path), str(final_path), script_path
 
 
 def launch_update_script(script_path):
     if not script_path or not os.path.isfile(script_path):
         return False
+    clean_env = _clean_spawn_env()
     if str(script_path).lower().endswith(".ps1"):
         subprocess.Popen(
             [
@@ -651,11 +770,13 @@ def launch_update_script(script_path):
             ],
             creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
             close_fds=True,
+            env=clean_env,
         )
         return True
     subprocess.Popen(
         ["cmd.exe", "/c", script_path],
         creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
         close_fds=True,
+        env=clean_env,
     )
     return True

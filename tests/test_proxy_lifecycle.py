@@ -24,49 +24,54 @@ class ProxyLifecycleTest(unittest.TestCase):
         (d / "SSJJ_BattleClient_Unity.exe").write_bytes(b"unity-stub")
         return d
 
-    def test_hide_in_dir_renames_version_dll_and_handles_slot_fallback(self):
+    def test_hide_in_dir_renames_proxy_dll_and_handles_slot_fallback(self):
+        dll_name = getattr(proxy, "NAME", "hid.dll")
+        alt_name = getattr(proxy, "RENAMED", ".hid.dat")
+        alt_prefix = alt_name[:-4] if alt_name.endswith(".dat") else ".hid"
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             b3 = self._make_battle_dir(root, "3_64")
-            src = root / "src_version.dll"
-            payload = b"proxy-dll-payload-v114"
+            src = root / ("src_" + dll_name)
+            payload = b"proxy-dll-payload-v120"
             src.write_bytes(payload)
-            (b3 / "version.dll").write_bytes(payload)
+            (b3 / dll_name).write_bytes(payload)
 
             with patch.object(proxy, "dll_source", return_value=str(src)):
                 res = proxy.hide_in_dir(str(b3))
                 self.assertTrue(_is_truthy_result(res), res)
-                self.assertFalse((b3 / "version.dll").exists())
-                self.assertEqual((b3 / ".ver.dat").read_bytes(), payload)
+                self.assertFalse((b3 / dll_name).exists())
+                self.assertEqual((b3 / alt_name).read_bytes(), payload)
 
-                # Slot fallback: existing .ver.dat occupies slot 0 while a new version.dll is hidden.
-                new_payload = b"proxy-dll-payload-v114-second"
-                (b3 / "version.dll").write_bytes(new_payload)
+                # Slot fallback: existing alt occupies slot 0 while a new proxy dll is hidden.
+                new_payload = b"proxy-dll-payload-v120-second"
+                (b3 / dll_name).write_bytes(new_payload)
                 res2 = proxy.hide_in_dir(str(b3))
                 self.assertTrue(_is_truthy_result(res2), res2)
-                self.assertFalse((b3 / "version.dll").exists())
+                self.assertFalse((b3 / dll_name).exists())
                 alt_contents = [
                     p.read_bytes()
                     for p in b3.iterdir()
-                    if p.is_file() and p.name.startswith(".ver") and p.name.endswith(".dat")
+                    if p.is_file() and p.name.startswith(alt_prefix) and p.name.endswith(".dat")
                 ]
                 self.assertIn(new_payload, alt_contents)
 
-                # Idempotent when version.dll is already absent.
+                # Idempotent when proxy dll is already absent.
                 res3 = proxy.hide_in_dir(str(b3))
                 self.assertTrue(_is_truthy_result(res3), res3)
 
     def test_heal_skips_active_dir_and_restores_after_exit(self):
+        dll_name = getattr(proxy, "NAME", "hid.dll")
+        alt_name = getattr(proxy, "RENAMED", ".hid.dat")
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             b3 = self._make_battle_dir(root, "3_64")
             b5 = self._make_battle_dir(root, "5_64")
-            src = root / "src_version.dll"
-            payload = b"proxy-dll-payload-v114"
+            src = root / ("src_" + dll_name)
+            payload = b"proxy-dll-payload-v120"
             src.write_bytes(payload)
-            # Both directories start hidden (.ver.dat) as in an ongoing/previous match.
-            (b3 / ".ver.dat").write_bytes(payload)
-            (b5 / ".ver.dat").write_bytes(payload)
+            # Both directories start hidden (.hid.dat / .ver.dat) as in an ongoing/previous match.
+            (b3 / alt_name).write_bytes(payload)
+            (b5 / alt_name).write_bytes(payload)
             state_file = root / "proxy_state.json"
             log_file = root / "proxy.log"
             guard_log = root / "risk_mode.log"
@@ -83,11 +88,11 @@ class ProxyLifecycleTest(unittest.TestCase):
                      patch.object(proxy, "STATE", str(state_file)), \
                      patch.object(proxy, "LOG", str(log_file)):
                     proxy.heal(**{skip_kw: {str(b3)}})
-                self.assertFalse((b3 / "version.dll").exists())
-                self.assertTrue((b3 / ".ver.dat").exists())
-                self.assertEqual((b5 / "version.dll").read_bytes(), payload)
+                self.assertFalse((b3 / dll_name).exists())
+                self.assertTrue((b3 / alt_name).exists())
+                self.assertEqual((b5 / dll_name).read_bytes(), payload)
                 # Re-hide b5 before guard._watch lifecycle check below.
-                (b5 / "version.dll").replace(b5 / ".ver.dat")
+                (b5 / dll_name).replace(b5 / alt_name)
 
             # 2) guard._watch() lifecycle check: runtime active process in b3, then exit.
             exe_3 = str(b3 / "SSJJ_BattleClient_Unity.exe")
@@ -142,11 +147,11 @@ class ProxyLifecycleTest(unittest.TestCase):
                         for cm in reversed(active_patches):
                             cm.__exit__(None, None, None)
 
-                # Active directory 3_64 MUST NOT receive version.dll while game process is running.
-                self.assertFalse((b3 / "version.dll").exists())
-                self.assertTrue((b3 / ".ver.dat").exists())
+                # Active directory 3_64 MUST NOT receive proxy dll while game process is running.
+                self.assertFalse((b3 / dll_name).exists())
+                self.assertTrue((b3 / alt_name).exists())
 
-                # Phase B: battle client exited -> next poll restores 3_64/version.dll.
+                # Phase B: battle client exited -> next poll restores 3_64/<dll_name>.
                 exit_patches = [
                     patch.object(proxy, "battle_dirs", return_value=[str(b3), str(b5)]),
                     patch.object(proxy, "dll_source", return_value=str(src)),
@@ -178,33 +183,41 @@ class ProxyLifecycleTest(unittest.TestCase):
                     for cm in reversed(exit_patches):
                         cm.__exit__(None, None, None)
 
-                self.assertEqual((b3 / "version.dll").read_bytes(), payload)
-                self.assertFalse((b3 / ".ver.dat").exists())
-                self.assertEqual((b5 / "version.dll").read_bytes(), payload)
+                self.assertEqual((b3 / dll_name).read_bytes(), payload)
+                self.assertFalse((b3 / alt_name).exists())
+                self.assertEqual((b5 / dll_name).read_bytes(), payload)
             finally:
                 guard._stop.clear()
                 guard._done_pids.clear()
                 guard._done_pids.update(orig_done)
 
     def test_uninstall_cleans_bak_files_and_keeps_unknown_dll(self):
+        dll_name = getattr(proxy, "NAME", "hid.dll")
+        alt_name = getattr(proxy, "RENAMED", ".hid.dat")
+        alt_prefix = alt_name[:-4] if alt_name.endswith(".dat") else ".hid"
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             b3 = self._make_battle_dir(root, "3_64")
             b5 = self._make_battle_dir(root, "5_64")
-            src = root / "src_version.dll"
-            payload = b"proxy-dll-payload-v114"
+            src = root / ("src_" + dll_name)
+            payload = b"proxy-dll-payload-v120"
             src.write_bytes(payload)
             src_md5 = hashlib.md5(payload).hexdigest()
 
-            (b3 / "version.dll").write_bytes(payload)
-            (b3 / ".ver.dat").write_bytes(payload)
-            (b3 / ".ver1.dat").write_bytes(payload)
-            (b3 / "version.dll.bak-20261125-130049").write_bytes(b"old-bak-1")
-            (b3 / "version.dll.bak-legacy").write_bytes(b"old-bak-2")
+            (b3 / dll_name).write_bytes(payload)
+            (b3 / alt_name).write_bytes(payload)
+            (b3 / (alt_prefix + "1.dat")).write_bytes(payload)
+            (b3 / (dll_name + ".bak-20261127-100000")).write_bytes(b"old-bak-1")
+            (b3 / (dll_name + ".bak-legacy")).write_bytes(b"old-bak-2")
 
-            # Unknown third-party version.dll in 5_64 should stay; backup .bak-* should still be cleaned.
-            (b5 / "version.dll").write_bytes(b"unknown-third-party-dll")
-            (b5 / "version.dll.bak-20261125-130049").write_bytes(b"old-bak-3")
+            # Legacy version.dll residuals should also be cleaned when migrated to hid.dll.
+            if dll_name.lower() == "hid.dll":
+                (b3 / ".ver.dat").write_bytes(payload)
+                (b3 / "version.dll.bak-20261125-130049").write_bytes(b"old-ver-bak")
+
+            # Unknown third-party dll in 5_64 should stay; backup .bak-* should still be cleaned.
+            (b5 / dll_name).write_bytes(b"unknown-third-party-dll")
+            (b5 / (dll_name + ".bak-20261127-100000")).write_bytes(b"old-bak-3")
 
             state = {"md5": src_md5, "installed": {str(b3): {"md5": src_md5}}}
             state_file = root / "proxy_state.json"
@@ -216,28 +229,33 @@ class ProxyLifecycleTest(unittest.TestCase):
                 ok, msg = proxy.uninstall()
 
             self.assertTrue(ok, msg)
-            self.assertFalse((b3 / "version.dll").exists())
-            self.assertFalse((b3 / ".ver.dat").exists())
-            self.assertFalse((b3 / ".ver1.dat").exists())
-            self.assertEqual(list(b3.glob("version.dll.bak-*")), [])
-            self.assertEqual(list(b5.glob("version.dll.bak-*")), [])
-            self.assertEqual((b5 / "version.dll").read_bytes(), b"unknown-third-party-dll")
+            self.assertFalse((b3 / dll_name).exists())
+            self.assertFalse((b3 / alt_name).exists())
+            self.assertFalse((b3 / (alt_prefix + "1.dat")).exists())
+            self.assertEqual(list(b3.glob(dll_name + ".bak-*")), [])
+            self.assertEqual(list(b5.glob(dll_name + ".bak-*")), [])
+            if dll_name.lower() == "hid.dll":
+                self.assertFalse((b3 / ".ver.dat").exists())
+                self.assertEqual(list(b3.glob("version.dll.bak-*")), [])
+            self.assertEqual((b5 / dll_name).read_bytes(), b"unknown-third-party-dll")
 
     def test_uninstall_fallback_when_proxy_state_missing(self):
+        dll_name = getattr(proxy, "NAME", "hid.dll")
+        alt_name = getattr(proxy, "RENAMED", ".hid.dat")
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             b3 = self._make_battle_dir(root, "3_64")
             b5 = self._make_battle_dir(root, "5_64")
-            src = root / "src_version.dll"
-            payload = b"proxy-dll-payload-v114"
+            src = root / ("src_" + dll_name)
+            payload = b"proxy-dll-payload-v120"
             src.write_bytes(payload)
 
-            # Even without proxy_state.json, uninstall() removes matching proxy DLLs, .ver*.dat, and .bak-*.
+            # Even without proxy_state.json, uninstall() removes matching proxy DLLs, alts, and .bak-*.
             missing_state = root / "missing" / "proxy_state.json"
-            (b3 / "version.dll").write_bytes(payload)
-            (b3 / ".ver.dat").write_bytes(payload)
-            (b3 / "version.dll.bak-20261125-130049").write_bytes(b"stale-bak")
-            (b5 / "version.dll").write_bytes(b"unrelated-third-party")
+            (b3 / dll_name).write_bytes(payload)
+            (b3 / alt_name).write_bytes(payload)
+            (b3 / (dll_name + ".bak-20261127-100000")).write_bytes(b"stale-bak")
+            (b5 / dll_name).write_bytes(b"unrelated-third-party")
 
             with patch.object(proxy, "battle_dirs", return_value=[str(b3), str(b5)]), \
                  patch.object(proxy, "dll_source", return_value=str(src)), \
@@ -245,10 +263,10 @@ class ProxyLifecycleTest(unittest.TestCase):
                 ok, msg = proxy.uninstall()
 
             self.assertTrue(ok, msg)
-            self.assertFalse((b3 / "version.dll").exists())
-            self.assertFalse((b3 / ".ver.dat").exists())
-            self.assertEqual(list(b3.glob("version.dll.bak-*")), [])
-            self.assertEqual((b5 / "version.dll").read_bytes(), b"unrelated-third-party")
+            self.assertFalse((b3 / dll_name).exists())
+            self.assertFalse((b3 / alt_name).exists())
+            self.assertEqual(list(b3.glob(dll_name + ".bak-*")), [])
+            self.assertEqual((b5 / dll_name).read_bytes(), b"unrelated-third-party")
 
 
 if __name__ == "__main__":

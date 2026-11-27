@@ -25,6 +25,10 @@ namespace SsjjRisk
     {
         static readonly object _lock = new object();
         static bool _installed;
+        static bool _wantsHooked;
+        static bool _quittingHooked;
+        static bool _wndProcHooked;
+        static bool _processExitHooked;
         static bool _held;
         static Delegate _wantsDelegate;
         static Delegate _quittingDelegate;
@@ -84,40 +88,84 @@ namespace SsjjRisk
             try { return File.Exists(FlagPath(FLAG_WNDPROC)); } catch { return false; }
         }
 
-        public static void Install()
+        public static bool Install(bool allowWndProcFallback = true)
         {
             if (!Enabled())
             {
-                Loader.Log("[exit] 退出保护已关闭（配置里 exit_hold=off）");
-                return;
+                lock (_lock)
+                {
+                    if (!_installed)
+                    {
+                        _installed = true;
+                        Loader.Log("[exit] 退出保护已关闭（配置里 exit_hold=off）");
+                    }
+                }
+                return true;
             }
             lock (_lock)
             {
-                if (_installed) return;
-                _installed = true;
+                if (_installed) return true;
             }
 
-            bool ok = HookWantsToQuit();
-            if (ok) Loader.Log("[exit] 已挂 Application.wantsToQuit：退出前先还原补丁");
-            else Loader.Log("[exit] wantsToQuit 挂不上（Unity 版本或反射失败）");
+            if (!_wantsHooked)
+            {
+                bool ok = HookWantsToQuit();
+                if (ok)
+                {
+                    _wantsHooked = true;
+                    Loader.Log("[exit] 已挂 Application.wantsToQuit：退出前先还原补丁");
+                }
+                else
+                {
+                    Loader.LogQ("[exit] wantsToQuit 暂未就绪（UnityEngine 未加载或反射失败）");
+                }
+            }
 
-            bool ok2 = HookQuitting();
-            if (ok2) Loader.Log("[exit] 已挂 Application.quitting：游戏主动退出时也会先还原");
-            else Loader.Log("[exit] quitting 事件挂不上（不影响，wantsToQuit 已兜住）");
+            if (!_quittingHooked)
+            {
+                bool ok2 = HookQuitting();
+                if (ok2)
+                {
+                    _quittingHooked = true;
+                    Loader.Log("[exit] 已挂 Application.quitting：游戏主动退出时也会先还原");
+                }
+                else
+                {
+                    Loader.LogQ("[exit] quitting 事件暂未就绪");
+                }
+            }
 
-            if (UseWndProc())
+            if (UseWndProc() && !_wndProcHooked)
             {
                 int n = HookWindows();
+                if (n > 0) _wndProcHooked = true;
                 Loader.Log("[exit] WndProc 兜底已挂 " + n + " 个窗口（可选，默认关）");
             }
-            else if (!ok)
+            else if (allowWndProcFallback && !_wantsHooked && !_wndProcHooked)
             {
                 int n = HookWindows();
+                if (n > 0) _wndProcHooked = true;
                 Loader.Log("[exit] 只剩 WndProc 兜底，已挂 " + n + " 个窗口");
             }
 
-            try { AppDomain.CurrentDomain.ProcessExit += delegate { Restore("ProcessExit"); }; }
-            catch { }
+            if (!_processExitHooked)
+            {
+                try
+                {
+                    AppDomain.CurrentDomain.ProcessExit += delegate { Restore("ProcessExit"); };
+                    _processExitHooked = true;
+                }
+                catch { }
+            }
+
+            // 只有真正挂上 wantsToQuit（或显式启用了 WndProc 且挂到窗口）才算安装完成；
+            // 否则返回 false 交由 StartPatchRetry 继续重试，避免早期注入时假成功。
+            bool ready = _wantsHooked || (UseWndProc() && _wndProcHooked);
+            if (ready)
+            {
+                lock (_lock) { _installed = true; }
+            }
+            return ready;
         }
 
         static bool HookWantsToQuit()

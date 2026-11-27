@@ -190,10 +190,10 @@ def launch(mode, weapon, skin, username, password, server, model="",
         st = guard.inject_state() or {}
         method = str(risk_config.get("inject.method") or "proxy").lower()
         if method == "proxy":
-            # 代理模式：载荷由 battle\*_64\version.dll 在战斗端启动时自己 load，
+            # 代理模式：载荷由 battle\*_64\hid.dll 在战斗端启动时自己 load，
             # 不需要常驻守护，也不需要 OpenProcess / CreateRemoteThread。
             ok2, msg2 = guard.inject_start()
-            say("③ 加载方式：version.dll 代理 · %s" % msg2)
+            say("③ 加载方式：hid.dll 代理 · %s" % msg2)
             if not ok2:
                 return False, "代理 DLL 未部署，换肤启动已停止：%s" % msg2
         elif not risk_config.get("inject.enabled") or not st.get("thread_alive"):
@@ -209,7 +209,7 @@ def launch(mode, weapon, skin, username, password, server, model="",
     if quick_login.active_official_lobby():
         say("④ 已在官方大厅，沿用当前会话；注入换肤已就绪")
         return True, "已在大厅，注入换肤已就绪（下一局生效）"
-    say("④ 打开官方启动器（在游戏窗口登录并选区）")
+    say("④ 直启官方微端（跳过启动器重复下载大厅，请在游戏窗口登录并选区）")
     return quick_login.launch_official(emit=say)
 
 

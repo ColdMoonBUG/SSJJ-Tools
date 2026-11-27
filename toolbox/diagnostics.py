@@ -59,14 +59,21 @@ def _sources():
     roots = [_ROOT]
     try:
         import boot
-        roots.append(Path(boot.data_dir()))
+        ddir = Path(boot.data_dir())
+        if not (getattr(sys, "frozen", False) and (
+                (ddir / "build_exe.py").is_file()
+                or (ddir / "toolbox" / "ssjj_toolbox.py").is_file())):
+            roots.append(ddir)
     except Exception:
         pass
     for root in roots:
         if root.is_dir():
             for p in root.iterdir():
-                if p.is_file() and (p.suffix.lower() in (".log", ".jsonl")
-                                    or p.name.lower() == "risk_inspect_probe.txt"):
+                if p.is_file() and (
+                    (p.suffix.lower() in (".log", ".jsonl")
+                     and not p.name.lower().startswith("dist-diagnostics-"))
+                    or p.name.lower() == "risk_inspect_probe.txt"
+                ):
                     out[str(p.resolve())] = p
     wooduan_logs = _ROOT.parent / "Wooduan" / "log"
     if wooduan_logs.is_dir():
@@ -166,7 +173,7 @@ _SENSITIVE_KEYS = (
     r'password|passwd|pwd|token|access_token|refresh_token|'
     r'authorization|cookie|secret|sessionid|session_key|'
     r'username|user_name|uname|account|loginname|'
-    r'sign|fcmsign|fcm_sign|fcmclientip|fcm_client_ip|clientip|client_ip|deviceinfo|device_info'
+    r'sign|fcmsign|fcm_sign|fcmclientip|fcm_client_ip|clientip|client_ip|ip|deviceinfo|device_info'
 )
 _KEY = re.compile(
     r'(?i)(?<![A-Za-z0-9_])'
@@ -194,6 +201,7 @@ _COOKIE = re.compile(r'(?im)^(\s*(?:set-cookie|cookie)\s*:\s*)[^\r\n]+')
 _URL = re.compile(r'(?:https?|wd\.ssjj\.[A-Za-z0-9_.-]+|wdapp)://[^\s"\'<>]+', re.I)
 _EMAIL = re.compile(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}')
 _VER_DAT_RE = re.compile(r'^\.ver[0-9]*\.dat$', re.I)
+_HID_DAT_RE = re.compile(r'^\.hid[0-9]*\.dat$', re.I)
 
 
 def redact(text):
@@ -272,9 +280,10 @@ def _proxy_source_info():
     if not src:
         cands = []
         base = getattr(sys, "_MEIPASS", None)
-        if base:
-            cands.append(Path(base) / "risk" / "proxy" / "version.dll")
-        cands.append(Path(__file__).resolve().parents[1] / "risk" / "proxy" / "version.dll")
+        for dll_name in ("hid.dll", "version.dll"):
+            if base:
+                cands.append(Path(base) / "risk" / "proxy" / dll_name)
+            cands.append(Path(__file__).resolve().parents[1] / "risk" / "proxy" / dll_name)
         for cand in cands:
             if cand.is_file():
                 src = str(cand)
@@ -319,6 +328,8 @@ def _battle_dir_lines(game, src_sha256):
         lines.append("battle/*: 不存在")
         return lines
 
+    any_hid_dat = False
+    any_hid_bak = False
     any_ver_dat = False
     any_bak = False
     for bdir in subdirs:
@@ -329,38 +340,70 @@ def _battle_dir_lines(game, src_sha256):
             lines.append("%s: %r" % (rel_dir, exc))
             continue
         exe_file = next((p for p in entries if p.is_file() and p.name.lower() == "ssjj_battleclient_unity.exe"), None)
+        hid_dll = next((p for p in entries if p.is_file() and p.name.lower() == "hid.dll"), None)
+        hid_dats = [p for p in entries if p.is_file() and _HID_DAT_RE.match(p.name)]
+        hid_baks = [p for p in entries if p.is_file() and p.name.lower().startswith("hid.dll.bak-")]
         ver_dll = next((p for p in entries if p.is_file() and p.name.lower() == "version.dll"), None)
         ver_dats = [p for p in entries if p.is_file() and _VER_DAT_RE.match(p.name)]
         baks = [p for p in entries if p.is_file() and p.name.lower().startswith("version.dll.bak-")]
+        if hid_dats:
+            any_hid_dat = True
+        if hid_baks:
+            any_hid_bak = True
         if ver_dats:
             any_ver_dat = True
         if baks:
             any_bak = True
 
         flags = []
-        if ver_dll and ver_dats:
+        if (hid_dll and hid_dats) or (ver_dll and ver_dats):
             flags.append("DUAL_CONFLICT")
+        elif hid_dll:
+            flags.append("ARMED")
+        elif hid_dats:
+            flags.append("HIDDEN")
         elif ver_dll:
             flags.append("ARMED")
         elif ver_dats:
             flags.append("HIDDEN")
         else:
             flags.append("CLEAN")
-        if baks:
+        if ver_dll or ver_dats or baks:
+            flags.append("LEGACY_VERSION_RESIDUAL")
+        if hid_baks or baks:
             flags.append("BAK_RESIDUAL")
-        if len(ver_dats) > 1 or any(p.name.lower() != ".ver.dat" for p in ver_dats):
+        if (len(hid_dats) > 1 or any(p.name.lower() != ".hid.dat" for p in hid_dats)
+                or len(ver_dats) > 1 or any(p.name.lower() != ".ver.dat" for p in ver_dats)):
             flags.append("MULTI_ALT")
+
+        hid_desc = "missing"
+        if hid_dll:
+            try:
+                h_sha = _digests(hid_dll)[0]
+                match_txt = (str(h_sha == src_sha256) if src_sha256 else "unknown")
+                if src_sha256 and h_sha != src_sha256:
+                    flags.append("SOURCE_MISMATCH")
+                hid_desc = "present(match=%s)" % match_txt
+            except OSError as exc:
+                hid_desc = "error(%r)" % exc
+        if hid_dats and src_sha256:
+            try:
+                if any(_digests(p)[0] != src_sha256 for p in hid_dats):
+                    flags.append("ALT_SOURCE_MISMATCH")
+            except OSError:
+                pass
 
         dll_desc = "missing"
         if ver_dll:
             try:
-                match_txt = (str(_digests(ver_dll)[0] == src_sha256) if src_sha256 else "unknown")
-                if src_sha256 and _digests(ver_dll)[0] != src_sha256:
+                v_sha = _digests(ver_dll)[0]
+                match_txt = (str(v_sha == src_sha256) if src_sha256 else "unknown")
+                if src_sha256 and not hid_dll and v_sha != src_sha256:
                     flags.append("SOURCE_MISMATCH")
                 dll_desc = "present(match=%s)" % match_txt
             except OSError as exc:
                 dll_desc = "error(%r)" % exc
-        if ver_dats and src_sha256:
+        if ver_dats and src_sha256 and not hid_dats:
             try:
                 if any(_digests(p)[0] != src_sha256 for p in ver_dats):
                     flags.append("ALT_SOURCE_MISMATCH")
@@ -368,21 +411,34 @@ def _battle_dir_lines(game, src_sha256):
                 pass
 
         dedup_flags = list(dict.fromkeys(flags))
-        lines.append("%s status=%s exe=%s version.dll=%s ver_dat=%s bak=%s" % (
+        lines.append("%s status=%s exe=%s hid.dll=%s hid_dat=%s hid_bak=%s version.dll=%s ver_dat=%s bak=%s" % (
             rel_dir, "|".join(dedup_flags),
             "present" if exe_file else "missing",
+            hid_desc,
+            [p.name for p in hid_dats] or "none",
+            [p.name for p in hid_baks] or "none",
             dll_desc,
             [p.name for p in ver_dats] or "none",
             [p.name for p in baks] or "none",
         ))
         if exe_file:
             lines.append(_format_battle_file(game, exe_file))
+        if hid_dll:
+            lines.append(_format_battle_file(game, hid_dll, src_sha256, check_match=True))
+        for p in hid_dats:
+            lines.append(_format_battle_file(game, p, src_sha256, check_match=True))
+        for p in hid_baks:
+            lines.append(_format_battle_file(game, p))
         if ver_dll:
             lines.append(_format_battle_file(game, ver_dll, src_sha256, check_match=True))
         for p in ver_dats:
             lines.append(_format_battle_file(game, p, src_sha256, check_match=True))
         for p in baks:
             lines.append(_format_battle_file(game, p))
+    if not any_hid_dat:
+        lines.append("battle/*/.hid*.dat: 不存在")
+    if not any_hid_bak:
+        lines.append("battle/*/hid.dll.bak-*: 不存在")
     if not any_ver_dat:
         lines.append("battle/*/.ver*.dat: 不存在")
     if not any_bak:
@@ -408,10 +464,12 @@ def _proxy_state_lines():
             entry_ts = info.get("ts") if isinstance(info, dict) else None
             entry_ts_txt = _iso(entry_ts) if isinstance(entry_ts, (int, float)) else entry_ts
             dp = Path(d)
+            has_hid = (dp / "hid.dll").is_file() if dp.is_dir() else False
+            has_hid_alt = any(_HID_DAT_RE.match(p.name) for p in dp.iterdir()) if dp.is_dir() else False
             has_dll = (dp / "version.dll").is_file() if dp.is_dir() else False
             has_alt = any(_VER_DAT_RE.match(p.name) for p in dp.iterdir()) if dp.is_dir() else False
-            lines.append("  proxy_state.entry dir=%s md5=%s ts=%s dir_exists=%s has_dll=%s has_alt=%s" % (
-                d, entry_md5, entry_ts_txt, dp.is_dir(), has_dll, has_alt))
+            lines.append("  proxy_state.entry dir=%s md5=%s ts=%s dir_exists=%s has_hid=%s has_hid_alt=%s has_dll=%s has_alt=%s" % (
+                d, entry_md5, entry_ts_txt, dp.is_dir(), has_hid, has_hid_alt, has_dll, has_alt))
     return lines
 
 
@@ -506,7 +564,7 @@ try {
 $from = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:SSJJ_DIAG_FROM).LocalDateTime
 try {
   Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-CodeIntegrity/Operational';StartTime=$from} -ErrorAction Stop |
-    Where-Object { $_.Message -match 'SSJJ|Wooduan|MicroClient|GameGuard|npgg|version\.dll|\.ver\.dat' } |
+    Where-Object { $_.Message -match 'SSJJ|Wooduan|MicroClient|GameGuard|npgg|hid\.dll|\.hid[0-9]*\.dat|version\.dll|\.ver[0-9]*\.dat' } |
     Select-Object -First 100 | ForEach-Object {
       '[{0:yyyy-MM-ddTHH:mm:sszzz}] id={1} {2}' -f $_.TimeCreated,$_.Id,$_.Message
     }
@@ -598,7 +656,8 @@ def _probe_registry_dll_policy():
         ) as k:
             idx = 0
             total = 0
-            hits = []
+            hits_ver = []
+            hits_hid = []
             while True:
                 try:
                     name, val, _typ = winreg.EnumValue(k, idx)
@@ -607,11 +666,14 @@ def _probe_registry_dll_policy():
                     n_low = (name or "").lower()
                     v_low = str(val or "").lower()
                     if n_low in ("version", "version.dll") or v_low in ("version", "version.dll"):
-                        hits.append("%s=%s" % (name, val))
+                        hits_ver.append("%s=%s" % (name, val))
+                    if n_low in ("hid", "hid.dll") or v_low in ("hid", "hid.dll"):
+                        hits_hid.append("%s=%s" % (name, val))
                 except OSError:
                     break
-            lines.append("  KnownDLLs: count=%d has_version=%s%s" % (
-                total, bool(hits), (" hits=%s" % hits) if hits else ""))
+            hits = hits_hid + hits_ver
+            lines.append("  KnownDLLs: count=%d has_hid=%s has_version=%s%s" % (
+                total, bool(hits_hid), bool(hits_ver), (" hits=%s" % hits) if hits else ""))
     except OSError as exc:
         lines.append("  KnownDLLs: 读取失败(%r)" % exc)
 
@@ -751,8 +813,8 @@ foreach ($ch in $channels) {
 
 
 def _probe_battle_binary_attrs():
-    """检查各 battle\\* 下 exe/UnityPlayer.dll 摘要及 version.dll Win32 属性与 MOTW。"""
-    lines = ["[battle\\* 关键文件与 version.dll 属性探针]"]
+    """检查各 battle\\* 下 exe/UnityPlayer.dll 摘要及 hid.dll / version.dll Win32 属性与 MOTW。"""
+    lines = ["[battle\\* 关键文件与 hid.dll / version.dll 属性探针]"]
     game = _game_dir()
     if not game or not game.is_dir():
         lines.append("  game_dir 未找到")
@@ -784,19 +846,20 @@ def _probe_battle_binary_attrs():
                     parts.append("%s(err=%r)" % (fname, exc))
             else:
                 parts.append("%s(missing)" % fname)
-        ver_dll = bdir / "version.dll"
-        if ver_dll.is_file():
-            try:
-                st = ver_dll.stat()
-                sha_head = _digests(ver_dll)[0][:16]
-                attrs = _file_attrs(st).strip() or "attrs=normal"
-                motw = _read_zone_identifier(ver_dll)
-                parts.append("version.dll(size=%d sha256=%s %s motw=%s)" % (
-                    st.st_size, sha_head, attrs, motw))
-            except OSError as exc:
-                parts.append("version.dll(err=%r)" % exc)
-        else:
-            parts.append("version.dll(missing)")
+        for dll_name in ("hid.dll", "version.dll"):
+            dll_fp = bdir / dll_name
+            if dll_fp.is_file():
+                try:
+                    st = dll_fp.stat()
+                    sha_head = _digests(dll_fp)[0][:16]
+                    attrs = _file_attrs(st).strip() or "attrs=normal"
+                    motw = _read_zone_identifier(dll_fp)
+                    parts.append("%s(size=%d sha256=%s %s motw=%s)" % (
+                        dll_name, st.st_size, sha_head, attrs, motw))
+                except OSError as exc:
+                    parts.append("%s(err=%r)" % (dll_name, exc))
+            else:
+                parts.append("%s(missing)" % dll_name)
         lines.append("  %s: %s" % (rel_dir, " | ".join(parts)))
     return lines
 

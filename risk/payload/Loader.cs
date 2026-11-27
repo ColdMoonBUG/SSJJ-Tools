@@ -187,9 +187,10 @@ namespace SsjjRisk
         static bool _done;
         static bool _guardPatched;
         static bool _acePatched;
+        static bool _exitGuarded;
         static volatile bool _retryQuiet;
 
-        static void LogQ(string msg) { if (!_retryQuiet) Log(msg); }
+        internal static void LogQ(string msg) { if (!_retryQuiet) Log(msg); }
 
         /// <summary>注入入口：无参静态方法，由 mono_runtime_invoke 调用。</summary>
         public static void Load()
@@ -221,11 +222,12 @@ namespace SsjjRisk
                 _acePatched = DowngradeAce();
                 Log("[*] DowngradeAce 返回 " + _acePatched);
                 // 退出保护要在补丁之后立刻挂上：抢在 GameGuard 收尾扫描之前把字节还原。
-                try { ExitGuard.Install(); }
+                try { _exitGuarded = ExitGuard.Install(false); }
                 catch (Exception ex) { Log("[exit] 安装失败: " + ex.GetType().Name + " " + ex.Message); }
                 WeaponSwapper.Start();
+                KillFeedSimulator.Install();
                 StartPatchRetry();
-                Log("=== 载荷收工（guard=" + _guardPatched + " ace=" + _acePatched + "） ===");
+                Log("=== 载荷收工（guard=" + _guardPatched + " ace=" + _acePatched + " exit=" + _exitGuarded + "） ===");
             }
             catch (Exception ex)
             {
@@ -255,12 +257,13 @@ namespace SsjjRisk
                 Thread.Sleep(sec * 1000);
 
                 Log("[stage] 3/4 开始：挂退出保护");
-                try { ExitGuard.Install(); Log("[stage] 3/4 完成"); }
+                try { _exitGuarded = ExitGuard.Install(true); Log("[stage] 3/4 完成 exit=" + _exitGuarded); }
                 catch (Exception ex) { Log("[stage] 3/4 失败: " + ex.Message); }
                 Thread.Sleep(sec * 1000);
 
                 Log("[stage] 4/4 开始：装换肤 IL Hook");
                 WeaponSwapper.Start();
+                KillFeedSimulator.Install();
                 Log("[stage] 4/4 完成");
                 StartPatchRetry();
                 Log("[stage] 分阶段全部完成（本局没被杀，说明这些改动都能过检测）");
@@ -279,16 +282,16 @@ namespace SsjjRisk
         /// </summary>
         static void StartPatchRetry()
         {
-            if (_guardPatched && _acePatched) return;
+            if (_guardPatched && _acePatched && _exitGuarded) return;
             Thread t = new Thread(delegate()
             {
                 try
                 {
                     // 前 3 秒用 60ms 高频轮询：RuntimeCheatGuard 的自检在启动后 1 秒内就跑，
-                    // 慢一拍就会被它先报「exe 旁边有可疑代理 DLL」。之后退回 500ms。
+                    // 慢一拍就会被它先报「exe 旁边有可疑代理 DLL」。之后退回 300ms。
                     for (int i = 0; i < 900; i++)
                     {
-                        if (_guardPatched && _acePatched) break;
+                        if (_guardPatched && _acePatched && _exitGuarded) break;
                         Thread.Sleep(i < 50 ? 60 : 300);
                         _retryQuiet = true;
                         try
@@ -305,12 +308,23 @@ namespace SsjjRisk
                                 if (ok) Log("[retry] ACE 补丁完成（第 " + (i + 1) + " 次重试）");
                                 _acePatched = ok;
                             }
+                            if (!_exitGuarded)
+                            {
+                                bool ok = ExitGuard.Install(false);
+                                if (ok) Log("[retry] 退出保护安装完成（第 " + (i + 1) + " 次重试）");
+                                _exitGuarded = ok;
+                            }
                         }
                         catch (Exception e) { Log("[retry] 异常: " + e.Message); }
                         finally { _retryQuiet = false; }
                     }
-                    if (_guardPatched && _acePatched) Log("=== 自检/ACE 已全部切断 ===");
-                    else Log("[!] 补丁重试结束仍未完成：guard=" + _guardPatched + " ace=" + _acePatched);
+                    if (!_exitGuarded)
+                    {
+                        try { _exitGuarded = ExitGuard.Install(true); }
+                        catch (Exception e) { Log("[exit] 兜底安装失败: " + e.Message); }
+                    }
+                    if (_guardPatched && _acePatched && _exitGuarded) Log("=== 自检/ACE/退出保护已全部就位 ===");
+                    else Log("[!] 补丁重试结束仍未完成：guard=" + _guardPatched + " ace=" + _acePatched + " exit=" + _exitGuarded);
                 }
                 catch (Exception e) { Log("[retry] 线程异常: " + e); }
             });
@@ -506,11 +520,12 @@ namespace SsjjRisk
         /// <summary>ACE 策略：none / teardown / full，来自 risk_ace_full.txt，缺省 none。</summary>
         static string AceMode()
         {
-            // 2026-11-25 改成缺省 none：
+            // 2026-11-25 改成缺省 none，2026-11-27 收紧历史残留兜底：
             // teardown 会打掉 AceClientManager.Exit/Close，等于不让 nProtect 正常收尾，
             // 实测「对局结束 → 进程退出」时多次崩在 npggNT64.des 自己的卸载流程里
             // （事件日志：npggNT64.des_unloaded + 0xc0000005）。
-            // none = 一点都不碰 ACE，登录/心跳/退出全走官方原样，客户端痕迹也最少。
+            // 仅当显式设置调试开关（SSJJ_ALLOW_ACE_PATCH=1 或文件内容以 debug:/force: 开头）
+            // 时才允许 teardown/full；历史残留的 bare teardown/full 一律兜底为 none。
             try
             {
                 string p = System.IO.Path.Combine(
@@ -518,9 +533,12 @@ namespace SsjjRisk
                     "ssjj-toolbox", "risk_ace_full.txt");
                 if (!System.IO.File.Exists(p)) return "none";
                 string s = System.IO.File.ReadAllText(p).Trim().ToLowerInvariant();
+                bool allowOverride = string.Equals(
+                    Environment.GetEnvironmentVariable("SSJJ_ALLOW_ACE_PATCH"), "1", StringComparison.Ordinal) ||
+                    s.StartsWith("debug:") || s.StartsWith("force:");
+                if (!allowOverride) return "none";
                 if (s.Contains("teardown")) return "teardown";
                 if (s.Contains("full")) return "full";
-                if (s.Length == 0 || s.Contains("none")) return "none";
                 return "none";
             }
             catch { return "none"; }
@@ -725,9 +743,12 @@ namespace SsjjRisk
             int hooks = 0;
             try { hooks = WeaponSwapper.UninstallHooks(); }
             catch (Exception e) { Log("[restore] 撤销 detour 失败: " + e.GetType().Name + " " + e.Message); }
+            int kf = 0;
+            try { kf = KillFeedSimulator.Restore(); }
+            catch (Exception e) { Log("[restore] 撤销击杀播报 Hook 失败: " + e.GetType().Name + " " + e.Message); }
             int bytes = RestoreAll();
-            Log("[restore] 全部还原完成：detour " + hooks + " 个 / 首字节 " + bytes + " 处");
-            return hooks + bytes;
+            Log("[restore] 全部还原完成：detour " + (hooks + kf) + " 个 / 首字节 " + bytes + " 处");
+            return hooks + kf + bytes;
         }
 
         static string name(MethodInfo m) { return m == null ? "?" : m.DeclaringType.Name + "." + m.Name; }

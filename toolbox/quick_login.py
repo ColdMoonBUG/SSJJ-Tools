@@ -379,8 +379,9 @@ def find_launcher_exe():
     return None
 
 
-def launch_official(emit=None):
-    """按官方入口无参数启动（避免触发 MicroClient 的 localtest 模式导致进局后大厅卡死）。"""
+def launch_official(emit=None, prefer_launcher=True):
+    """按官方入口无参数启动（优先 WDlauncher.exe，避免直启 MicroClient 带 URL 触发 localtest 模式与崩溃）。"""
+    _ = prefer_launcher  # 兼容旧调用签名，始终走官方无参数启动
     if active_official_lobby():
         return True, "官方大厅已打开，沿用当前会话"
     launcher = find_launcher_exe()
