@@ -594,7 +594,7 @@ namespace SsjjRisk
                 Loader.Log("[skin] 开镜准星 IL Hook 失败: " + ex.Message);
             }
 
-            // 1.5 切枪 150ms 开镜闪屏去抖：Hook UiIEventCondition.Get_uiCross_AwpVisible()
+            // 1.5 切枪期间过滤短暂开镜脉冲，持续开镜不等待整个原枪切枪窗口。
             try
             {
                 Type uiCond = FindType("Assets.Sources.Modules.Ui.UiEventCondition.UiIEventCondition");
@@ -603,7 +603,7 @@ namespace SsjjRisk
                 {
                     IntPtr ptr = BuildAwpVisibleIL();
                     if (ptr != IntPtr.Zero && InstallJumpHookPtr(mAwpVis, ptr))
-                        Loader.Log("[skin] Hook 已写入: UiIEventCondition.Get_uiCross_AwpVisible (切枪 150ms 开镜闪屏去抖)");
+                        Loader.Log("[skin] Hook 已写入: UiIEventCondition.Get_uiCross_AwpVisible (切枪短脉冲过滤)");
                 }
             }
             catch (Exception ex)
@@ -629,29 +629,46 @@ namespace SsjjRisk
             }
         }
 
-        private static long _awpTrueSinceTick;
+        private const int ScopePulseFilterMs = 70;
+        private static bool _scopeLastRaw;
+        private static bool _scopeLastGuard;
+        private static bool _scopePulsePending;
+        private static long _scopePendingSince;
+
+        private static void ResetScopeFilter()
+        {
+            _scopeLastRaw = false;
+            _scopeLastGuard = false;
+            _scopePulsePending = false;
+            _scopePendingSince = 0;
+        }
 
         public static bool FilterAwpCrossVisible(bool rawVisible)
         {
+            bool guarded = InspectPlayback.IsRaiseGuardActive();
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!rawVisible)
             {
-                _awpTrueSinceTick = 0;
-                return false;
+                _scopePulsePending = false;
+                _scopePendingSince = 0;
             }
-            if (!InspectPlayback.IsInRaiseGuardWindow(600))
+            else
             {
-                _awpTrueSinceTick = 0;
-                return true;
+                // A rising guard also hides stale scope state carried across a weapon switch.
+                if (guarded && (!_scopeLastRaw || !_scopeLastGuard))
+                {
+                    _scopePulsePending = true;
+                    _scopePendingSince = now;
+                }
+                if (_scopePulsePending &&
+                    now - _scopePendingSince >= ScopePulseFilterMs * System.Diagnostics.Stopwatch.Frequency / 1000)
+                    _scopePulsePending = false;
             }
-            long now = System.Diagnostics.Stopwatch.GetTimestamp();
-            long since = _awpTrueSinceTick;
-            if (since <= 0)
-            {
-                _awpTrueSinceTick = now;
-                return false;
-            }
-            long heldMs = (now - since) * 1000 / System.Diagnostics.Stopwatch.Frequency;
-            return heldMs >= 150;
+            _scopeLastRaw = rawVisible;
+            _scopeLastGuard = guarded;
+            bool visible = rawVisible && !_scopePulsePending;
+            InspectProbe.TraceScopeGetter(rawVisible, guarded, visible);
+            return visible;
         }
 
         private static IntPtr BuildAwpVisibleIL()
@@ -1532,7 +1549,7 @@ namespace SsjjRisk
         public static int UninstallHooks()
         {
             int n = 0;
-            _awpTrueSinceTick = 0;
+            ResetScopeFilter();
             InspectPlayback.Reset();
             lock (_hookLock)
             {

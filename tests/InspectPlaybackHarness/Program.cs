@@ -35,7 +35,7 @@ public class View : IFakeView, Assets.Sources.Components.Interface.Info.AnimStat
     {
         StateId = state;
         IsLoop = (state == 13 || state == 39);
-        AnimationName = state == 170 ? "light-second" : state == 13 ? "idle" : "other";
+        AnimationName = state == 170 ? "light-second" : state == 13 ? "idle" : state == 45 ? "inspect-next" : "other";
     }
     public int StateId { get; set; }
     public bool IsLoop { get; set; }
@@ -45,7 +45,7 @@ public interface IFakeWeaponInfo { int GetViewAnimDuration(int state); }
 public class AnimInfo : IFakeWeaponInfo
 {
     public int GetViewAnimDuration(int state) =>
-        state == 44 ? 6033 : state == 20 ? 1600 : state == 31 ? 900 :
+        state == 44 ? 2599 : state == 20 ? 1600 : state == 31 ? 900 :
         state == 170 ? 1433 : state == 16 ? 467 : state == 29 ? 0 : 800;
 }
 public interface IFakeAnimator
@@ -83,7 +83,8 @@ namespace SsjjRisk
     {
         public static string ResolveModelWeapon(string name) =>
             name == "brick_knife_gold" ? "butterfly_knife" :
-            name == "verdict_legend2" ? "awm_legend_t" : name;
+            name == "verdict_legend2" ? "awm_legend_t" :
+            name == "test_source" ? "test_target" : name;
     }
 }
 public static class Program
@@ -125,13 +126,33 @@ public static class Program
         raiseClock.GetType().GetField("Started", BindingFlags.Instance | BindingFlags.NonPublic)
                   .SetValue(raiseClock, Stopwatch.GetTimestamp() - Stopwatch.Frequency / 2);
         Frame(raise, 800);
+        Check(InspectPlayback.IsRaiseGuardActive(), "guard stays active within the raise window");
+        var deadlineField = typeof(InspectPlayback).GetField("_raiseGuardDeadline", BindingFlags.Static | BindingFlags.NonPublic);
+        long deadline = (long)deadlineField.GetValue(null);
+        Frame(raise, 790);
+        Check((long)deadlineField.GetValue(null) == deadline, "repeated callbacks must not extend raise deadline");
+        deadlineField.SetValue(null, Stopwatch.GetTimestamp() - 1);
+        Check(!InspectPlayback.IsRaiseGuardActive(), "guard expires without an animation callback");
+        deadlineField.SetValue(null, deadline);
+        var remote = new Animator();
+        object[] remoteArgs = { new ViewSystem(), remote, hand, idle, 0, 500, info, 0.25f };
+        replacement.DynamicInvoke(remoteArgs);
+        Check(InspectPlayback.IsRaiseGuardActive(), "remote animation cannot clear local raise guard");
+        Frame(raise, 800);
         Check(hand.Name == "idle" && Math.Abs(hand.Speed - 1f) < 0.001f && hand.Time >= 0f,
               "raise stage 2 after targetDur must smoothly switch to TORSO_STAND idle");
         Contexts.sharedInstance.player.myPlayerEntity.currentWeapon.WeaponInfo.Name = "brick_knife_gold";
         Frame(idle, 500);
+        Check(!InspectPlayback.IsRaiseGuardActive(), "guard ends when local raise ends");
+        Frame(raise, 488);
+        long initialDeadline = (long)deadlineField.GetValue(null);
+        Frame(raise, 1255);
+        Check((long)deadlineField.GetValue(null) > initialDeadline,
+              "authoritative timer jump must extend the new raise window");
+        Frame(idle, 500);
 
         Frame(inspect, 2988);
-        Check(hand.Name == "showgun" && hand.Time < 0.2f && time == 3045,
+        Check(hand.Name == "showgun" && hand.Time < 0.2f && time == -389,
               "inspect must begin visually at zero while keeping game time");
         Thread.Sleep(35);
         Frame(idle, 800);
@@ -185,8 +206,52 @@ public static class Program
         Check(hand.Name == "light-second" && hand.Time < 0.1f,
               "continuous light combo must alternate stage 31 / 170");
         InspectPlayback.Reset();
+        Contexts.sharedInstance.player.myPlayerEntity.currentWeapon.WeaponInfo.Name = "test_source";
+        Assets.Sources.Info.WeaponAnim.WeaponAnimInfoFactory.Instance._weaponInfoCache.Target = new TargetInfo();
+        Frame(inspect, 2400);
+        clock = clockField.GetValue(null);
+        Check(clock != null, "non-butterfly mapping must start inspect");
+        Check((int)clock.GetType().GetField("Duration", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(clock) == 700,
+              "target metadata must override source duration");
+        clock.GetType().GetField("Started", BindingFlags.Instance | BindingFlags.NonPublic)
+             .SetValue(clock, Stopwatch.GetTimestamp() - Stopwatch.Frequency * 8 / 10);
+        Frame(idle, 500);
+        Check(hand.Name == "inspect-next" && hand.Time >= 0.09f && hand.Time < 0.3f,
+              "target next animation must play with elapsed carryover");
+        Frame(attack, 700);
+        Check(hand.Name == "attack", "attack interrupts target sequence");
+        Frame(inspect, 2400);
+        clock = clockField.GetValue(null);
+        clock.GetType().GetField("Started", BindingFlags.Instance | BindingFlags.NonPublic)
+             .SetValue(clock, Stopwatch.GetTimestamp() - Stopwatch.Frequency * 3);
+        Frame(inspect, 2100);
+        clock = clockField.GetValue(null);
+        Check(clock != null && (bool)clock.GetType().GetField("Finished", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(clock),
+              "finished target sequence is latched while original inspect state continues");
+        Frame(inspect, 2000);
+        Check(ReferenceEquals(clock, clockField.GetValue(null)), "finished inspect must not restart each frame");
+        InspectPlayback.Reset();
         Frame(idle, 500);
         Check(hand.Name == "idle", "reset must restore game animation");
         Console.WriteLine("InspectPlayback: inspect clock, heavy/light rescale, two-stage combo, attack/switch cancellation, reset OK");
     }
+}
+
+namespace Assets.Sources.Info.WeaponAnim
+{
+    public class WeaponAnimInfoFactory
+    {
+        public static WeaponAnimInfoFactory Instance = new WeaponAnimInfoFactory();
+        public FakeCache _weaponInfoCache = new FakeCache();
+    }
+    public class FakeCache
+    {
+        public TargetInfo Target;
+        public object GetOrNull(string name) => name == "test_target" ? Target : null;
+    }
+}
+public class TargetInfo
+{
+    public int GetViewAnimDuration(int state) => state == 44 ? 700 : state == 45 ? 1200 : 0;
+    public int ViewGetNextAnim(int state) => state == 44 ? 45 : -1;
 }

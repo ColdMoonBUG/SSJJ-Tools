@@ -19,6 +19,10 @@ namespace SsjjRisk
             internal string Weapon;
             internal int Duration;
             internal int LastState;
+            internal int VisualState;
+            internal int LastRemain;
+            internal bool Finished;
+            internal object TargetInfo;
             internal long Started;
             internal long LastWeaponCheck;
         }
@@ -53,7 +57,11 @@ namespace SsjjRisk
         private static Clock _clock;
         private static AttackClock _attack;
         private static RaiseClock _raise;
-        private static long _lastRaiseStartTick;
+        private static long _raiseGuardDeadline;
+        private static object _raiseGuardAnimator;
+        private static string _raiseGuardWeapon;
+        private static int _raiseGuardState;
+        private static int _raiseGuardRemain;
         private static object _standView;
         private static object _specialStandView;
         private static Type _standViewType;
@@ -67,7 +75,7 @@ namespace SsjjRisk
             _clock = null;
             _attack = null;
             _raise = null;
-            System.Threading.Interlocked.Exchange(ref _lastRaiseStartTick, 0);
+            ClearRaiseGuard();
             _standView = null;
             _specialStandView = null;
             _standViewType = null;
@@ -75,12 +83,41 @@ namespace SsjjRisk
             _secondLightType = null;
         }
 
-        internal static bool IsInRaiseGuardWindow(int windowMs)
+        internal static bool IsRaiseGuardActive()
         {
-            long started = System.Threading.Interlocked.Read(ref _lastRaiseStartTick);
-            if (started <= 0 || windowMs <= 0) return false;
-            long elapsedMs = (Stopwatch.GetTimestamp() - started) * 1000 / Stopwatch.Frequency;
-            return elapsedMs >= 0 && elapsedMs < windowMs;
+            long deadline = System.Threading.Interlocked.Read(ref _raiseGuardDeadline);
+            return deadline > 0 && Stopwatch.GetTimestamp() < deadline;
+        }
+
+        private static void ClearRaiseGuard()
+        {
+            System.Threading.Interlocked.Exchange(ref _raiseGuardDeadline, 0);
+            _raiseGuardAnimator = null;
+            _raiseGuardWeapon = null;
+            _raiseGuardRemain = 0;
+        }
+
+        private static void UpdateRaiseGuard(object animator, int state, int remain, long now)
+        {
+            string weapon = CurrentWeapon();
+            bool restart = !ReferenceEquals(_raiseGuardAnimator, animator) ||
+                _raiseGuardState != state ||
+                !string.Equals(_raiseGuardWeapon, weapon, StringComparison.OrdinalIgnoreCase) ||
+                remain > _raiseGuardRemain + 80;
+            if (remain <= 0 || remain > 6000)
+            {
+                ClearRaiseGuard();
+                return;
+            }
+            if (restart)
+            {
+                _raiseGuardAnimator = animator;
+                _raiseGuardWeapon = weapon;
+                _raiseGuardState = state;
+                System.Threading.Interlocked.Exchange(ref _raiseGuardDeadline,
+                    now + remain * Stopwatch.Frequency / 1000);
+            }
+            _raiseGuardRemain = remain;
         }
 
         private static object Read(object value, string name)
@@ -161,6 +198,46 @@ namespace SsjjRisk
             return null;
         }
 
+        private static object TargetAnimationInfo(string target)
+        {
+            if (string.IsNullOrEmpty(target)) return null;
+            try
+            {
+                foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type factoryType = assembly.GetType("Assets.Sources.Info.WeaponAnim.WeaponAnimInfoFactory", false);
+                    if (factoryType == null) continue;
+                    object cache = Read(Read(factoryType, "Instance"), "_weaponInfoCache");
+                    if (cache == null) return null;
+                    MethodInfo get = cache.GetType().GetMethod("GetOrNull", All, null,
+                        new[] { typeof(string) }, null);
+                    return get == null ? null : get.Invoke(cache, new object[] { target });
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static int AnimationValue(object info, string method, int state, int fallback)
+        {
+            if (info == null) return fallback;
+            MethodInfo get = info.GetType().GetMethod(method, All, null, new[] { typeof(int) }, null);
+            return get == null ? fallback : Convert.ToInt32(get.Invoke(info, new object[] { state }));
+        }
+
+        private static int TargetDuration(object animator, object view, object info, int state)
+        {
+            int duration = AnimationValue(info, "GetViewAnimDuration", state, 0);
+            if (duration > 0 && duration <= 120000) return duration;
+            string name = Read(view, "AnimationName") as string;
+            if (animator == null || string.IsNullOrEmpty(name)) return 0;
+            MethodInfo get = animator.GetType().GetMethod("GetAnimDuration", All, null,
+                new[] { typeof(int), typeof(string) }, null);
+            if (get == null) return 0;
+            double seconds = Convert.ToDouble(get.Invoke(animator, new object[] { 0, name }));
+            return seconds > 0 && seconds <= 120 ? (int)(seconds * 1000) : 0;
+        }
+
         public static object Adjust(object animator, object view, int state, int remain,
                                     int duration, object animInfo,
                                     ref int visualTime, ref float visualSpeed)
@@ -171,6 +248,7 @@ namespace SsjjRisk
                 if (IsRaiseState(state))
                 {
                     if (!IsLocalAnimator(animator)) return view;
+                    UpdateRaiseGuard(animator, state, remain, now);
                     _clock = null;
                     _attack = null;
                     RaiseClock raise = _raise;
@@ -179,7 +257,6 @@ namespace SsjjRisk
                         raise.State != state || remain > raise.LastRemain + 80;
                     if (restart)
                     {
-                        System.Threading.Interlocked.Exchange(ref _lastRaiseStartTick, now);
                         string name = CurrentWeapon();
                         string target = WeaponSwapper.ResolveModelWeapon(name);
                         if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(target) &&
@@ -238,6 +315,8 @@ namespace SsjjRisk
                     visualSpeed = 0f;
                     return view;
                 }
+                if (!IsLocalAnimator(animator)) return view;
+                ClearRaiseGuard();
                 _raise = null;
                 if (IsKnifeAttack(state))
                 {
@@ -321,14 +400,29 @@ namespace SsjjRisk
 
                 if (state == 44)
                 {
+                    if (clock != null && clock.Finished)
+                    {
+                        if (remain <= clock.LastRemain + 80)
+                        {
+                            clock.LastRemain = remain;
+                            return view;
+                        }
+                        clock = null;
+                        _clock = null;
+                    }
                     if (clock == null || clock.LastState != 44)
                     {
                         string name = CurrentWeapon();
-                        if (!IsLocalAnimator(animator) ||
-                            !string.Equals(WeaponSwapper.ResolveModelWeapon(name),
-                                           "butterfly_knife", StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(name, "butterfly_knife", StringComparison.OrdinalIgnoreCase) ||
-                            duration < 4000 || duration > 12000)
+                        string target = WeaponSwapper.ResolveModelWeapon(name);
+                        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(target) ||
+                            string.Equals(name, target, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _clock = null;
+                            return view;
+                        }
+                        object targetInfo = TargetAnimationInfo(target);
+                        int targetDuration = TargetDuration(animator, view, targetInfo, 44);
+                        if (targetDuration <= 0)
                         {
                             _clock = null;
                             return view;
@@ -336,12 +430,12 @@ namespace SsjjRisk
                         clock = new Clock
                         {
                             Animator = animator, InspectView = view, Weapon = name,
-                            Duration = duration, LastState = 44,
-                            Started = now, LastWeaponCheck = now
+                            Duration = targetDuration, LastState = 44, VisualState = 44, LastRemain = remain,
+                            TargetInfo = targetInfo, Started = now, LastWeaponCheck = now
                         };
                         _clock = clock;
-                        Loader.Log("[inspect] 本地长检视开始: " + name +
-                                   " 目标=butterfly_knife 时长=" + duration + "ms");
+                        Loader.Log("[inspect] 本地检视开始: " + name + " 目标=" + target +
+                                   " 时长=" + targetDuration + "ms");
                     }
                 }
                 else if (clock == null || (state != 13 && state != 14))
@@ -351,10 +445,30 @@ namespace SsjjRisk
                 }
 
                 long elapsed = (now - clock.Started) * 1000 / Stopwatch.Frequency;
+                // Follow the target's declared sequence, but stop loops or invalid metadata.
+                int transitions = 0;
+                while (elapsed >= clock.Duration && transitions++ < 16)
+                {
+                    int next = AnimationValue(clock.TargetInfo, "ViewGetNextAnim", clock.VisualState, -1);
+                    if (next < 0 || next == clock.VisualState || next == 13 || next == 14 || next == 39)
+                    {
+                        if (state == 44) { clock.Finished = true; clock.LastRemain = remain; }
+                        else _clock = null;
+                        return view;
+                    }
+                    object nextView;
+                    try { nextView = Activator.CreateInstance(clock.InspectView.GetType(), new object[] { next }); }
+                    catch { _clock = null; return view; }
+                    int nextDuration = TargetDuration(animator, nextView, clock.TargetInfo, next);
+                    if (nextDuration <= 0) { _clock = null; return view; }
+                    elapsed -= clock.Duration;
+                    clock.Started += clock.Duration * Stopwatch.Frequency / 1000;
+                    clock.InspectView = nextView;
+                    clock.VisualState = next;
+                    clock.Duration = nextDuration;
+                }
                 if (elapsed < 0 || elapsed >= clock.Duration)
                 {
-                    if (elapsed >= clock.Duration)
-                        Loader.Log("[inspect] 本地长检视播放完成");
                     _clock = null;
                     return view;
                 }
@@ -370,6 +484,7 @@ namespace SsjjRisk
                     clock.LastWeaponCheck = now;
                 }
                 clock.LastState = state;
+                clock.LastRemain = remain;
                 visualTime = (int)elapsed;
                 return clock.InspectView;
             }
@@ -378,6 +493,7 @@ namespace SsjjRisk
                 _clock = null;
                 _attack = null;
                 _raise = null;
+                ClearRaiseGuard();
                 return view;
             }
         }

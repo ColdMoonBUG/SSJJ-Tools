@@ -44,8 +44,14 @@ namespace SsjjRisk
     {
         public static IntPtr Build(MethodInfo value) => IntPtr.Zero;
         public static void Reset() { }
+        public static bool Guard;
+        public static bool IsRaiseGuardActive() => Guard;
     }
-    internal static class InspectProbe { public static void Start() { } }
+    internal static class InspectProbe
+    {
+        public static void Start() { }
+        public static void TraceScopeGetter(bool raw, bool guarded, bool visible) { }
+    }
 }
 
 public static class Program
@@ -57,6 +63,30 @@ public static class Program
 
     public static void Main()
     {
+        var scopeType = typeof(WeaponSwapper);
+        var pendingSince = scopeType.GetField("_scopePendingSince", BindingFlags.NonPublic | BindingFlags.Static);
+        long ticks = System.Diagnostics.Stopwatch.Frequency;
+        InspectPlayback.Guard = true;
+        Check(!WeaponSwapper.FilterAwpCrossVisible(true), "new scope during raise starts hidden");
+        pendingSince.SetValue(null, System.Diagnostics.Stopwatch.GetTimestamp() - ticks * 55 / 1000);
+        Check(!WeaponSwapper.FilterAwpCrossVisible(true), "55ms switch pulse stays hidden");
+        Check(!WeaponSwapper.FilterAwpCrossVisible(false), "short pulse ends hidden");
+        Check(!WeaponSwapper.FilterAwpCrossVisible(true), "sustained scope starts pending");
+        pendingSince.SetValue(null, System.Diagnostics.Stopwatch.GetTimestamp() - ticks * 71 / 1000);
+        Check(WeaponSwapper.FilterAwpCrossVisible(true), "sustained scope shows during raise");
+        Check(WeaponSwapper.FilterAwpCrossVisible(true), "admitted scope remains visible during raise");
+        Check(!WeaponSwapper.FilterAwpCrossVisible(false), "scope closes immediately");
+        Check(!WeaponSwapper.FilterAwpCrossVisible(true), "new guarded scope starts pending");
+        InspectPlayback.Guard = false;
+        Check(!WeaponSwapper.FilterAwpCrossVisible(true), "guard ending does not expose a short pulse");
+        pendingSince.SetValue(null, System.Diagnostics.Stopwatch.GetTimestamp() - ticks * 71 / 1000);
+        Check(WeaponSwapper.FilterAwpCrossVisible(true), "pending scope shows after filter window");
+        Check(!WeaponSwapper.FilterAwpCrossVisible(false), "scope hides on false");
+        Check(WeaponSwapper.FilterAwpCrossVisible(true), "normal scope visibility is immediate");
+        InspectPlayback.Guard = true;
+        Check(!WeaponSwapper.FilterAwpCrossVisible(true), "new raise hides previous weapon scope");
+        Check(!WeaponSwapper.FilterAwpCrossVisible(false), "switch hides previous scope immediately");
+        InspectPlayback.Guard = false;
         var type = typeof(WeaponSwapper);
         type.GetField("_activeModels", BindingFlags.NonPublic | BindingFlags.Static)
             .SetValue(null, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)

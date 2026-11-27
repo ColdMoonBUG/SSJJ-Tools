@@ -11,6 +11,9 @@ namespace SsjjRisk
         private const BindingFlags Flags = BindingFlags.Public | BindingFlags.NonPublic |
                                            BindingFlags.Instance | BindingFlags.Static;
         private static int _started;
+        private static int _scopeTraceEnabled;
+        private static int _lastScopeTrace = -1;
+        private static long _lastScopeTraceTick;
         private static Type _contextsType;
         private static Type _animFactoryType;
         private static Type _crossLoaderType;
@@ -38,12 +41,26 @@ namespace SsjjRisk
                     "ssjj-toolbox");
                 if (!File.Exists(Path.Combine(dir, "risk_inspect_probe.txt"))) return;
                 if (Interlocked.Exchange(ref _started, 1) != 0) return;
+                Interlocked.Exchange(ref _scopeTraceEnabled, 1);
                 Thread thread = new Thread(Run);
                 thread.IsBackground = true;
                 thread.Name = "SsjjInspectProbe";
                 thread.Start();
             }
             catch (Exception ex) { Log("[inspect] 启动失败: " + ex.Message); }
+        }
+
+        // UI 条件可能只在事件触发时求值；记录调用本身，而不是假设每帧都会调用。
+        internal static void TraceScopeGetter(bool raw, bool guarded, bool visible)
+        {
+            if (Interlocked.CompareExchange(ref _scopeTraceEnabled, 0, 0) == 0) return;
+            int value = (raw ? 1 : 0) | (guarded ? 2 : 0) | (visible ? 4 : 0);
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long last = Interlocked.Read(ref _lastScopeTraceTick);
+            if (value == _lastScopeTrace && now - last < System.Diagnostics.Stopwatch.Frequency) return;
+            _lastScopeTrace = value;
+            Interlocked.Exchange(ref _lastScopeTraceTick, now);
+            Log("[scope-ui] getter raw=" + raw + " guard=" + guarded + " visible=" + visible);
         }
 
         private static Type FindType(string name)
@@ -155,8 +172,10 @@ namespace SsjjRisk
             int lastState = -1;
             int lastBucket = -1;
             bool uiMethodsLogged = false;
+            string lastScopeSample = null;
+            long lastScopeSampleTick = 0;
             DateTime deadline = DateTime.UtcNow.AddMinutes(3);
-            Log("[inspect] 采样开始，最多三分钟；仅记录蝶舞映射的动作变化");
+            Log("[inspect] 采样开始，最多三分钟；记录蝶舞动作和开镜状态");
             while (DateTime.UtcNow < deadline)
             {
                 try
@@ -166,6 +185,35 @@ namespace SsjjRisk
                     object player = Read(Read(contexts, "player"), "myPlayerEntity");
                     object weapon = Read(Read(Read(player, "currentWeapon"), "WeaponInfo"), "Name");
                     string name = weapon as string;
+                    string target = WeaponSwapper.ResolveModelWeapon(name);
+                    if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(target) &&
+                        !string.Equals(name, target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        object scopeView = Read(player, "viewAnim");
+                        object scopeInfo = Read(scopeView, "ViewAnimInfo");
+                        object snapshot = Read(Read(player, "basicInfo"), "Current");
+                        object cross = Read(contexts, "cross");
+                        string scopeSample = "武器=" + name + " 目标=" + target +
+                            " 动作=" + (Read(scopeInfo, "StateId") ?? "?") +
+                            " 剩余=" + (Read(scopeView, "RemainTime") ?? "?") +
+                            " 快照动作=" + (Read(snapshot, "ViewAnim") ?? "?") +
+                            " 快照剩余=" + (Read(snapshot, "ViewAnimationTimer") ?? "?") +
+                            " raw=" + (Read(cross, "isAwpCross") ?? "?") +
+                            " guard=" + InspectPlayback.IsRaiseGuardActive();
+                        // Ignore countdown changes when deciding whether to emit; still sample every second.
+                        string scopeKey = name + "|" + (Read(scopeInfo, "StateId") ?? "?") + "|" +
+                            (Read(snapshot, "ViewAnim") ?? "?") + "|" +
+                            (Read(cross, "isAwpCross") ?? "?") + "|" + InspectPlayback.IsRaiseGuardActive();
+                        long scopeNow = System.Diagnostics.Stopwatch.GetTimestamp();
+                        if (scopeKey != lastScopeSample ||
+                            scopeNow - lastScopeSampleTick >= System.Diagnostics.Stopwatch.Frequency)
+                        {
+                            Log("[scope-sample] " + scopeSample);
+                            lastScopeSample = scopeKey;
+                            lastScopeSampleTick = scopeNow;
+                        }
+                    }
+                    else lastScopeSample = null;
                     if (!string.IsNullOrEmpty(name) &&
                         string.Equals(WeaponSwapper.ResolveModelWeapon(name), "butterfly_knife",
                                       StringComparison.OrdinalIgnoreCase))
@@ -227,6 +275,7 @@ namespace SsjjRisk
                 }
                 Thread.Sleep(100);
             }
+            Interlocked.Exchange(ref _scopeTraceEnabled, 0);
             Log("[inspect] 采样结束");
         }
     }
