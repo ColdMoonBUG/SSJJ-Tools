@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import backend
-import lobby_overlay
 
 
 class StreamerConfigTest(unittest.TestCase):
@@ -66,22 +65,6 @@ class StreamerConfigTest(unittest.TestCase):
                 self.assertEqual(corrupted, defaults)
 
 
-class LobbyOverlayMathTest(unittest.TestCase):
-    def test_compute_overlay_rect_base_and_scaled(self):
-        # 基准 1024x650 窗口
-        x, y, w, h = lobby_overlay.compute_overlay_rect((100, 200, 1024, 650))
-        self.assertEqual((x, y, w, h), (140, 204, 248, 26))
-
-        # 2x 放大窗口（2048x1300）
-        x2, y2, w2, h2 = lobby_overlay.compute_overlay_rect((0, 0, 2048, 1300))
-        self.assertEqual((x2, y2, w2, h2), (80, 8, 496, 52))
-
-        # 极小窗口保护下限（宽 >= 140，高 >= 22）
-        _x3, _y3, w3, h3 = lobby_overlay.compute_overlay_rect((10, 20, 320, 200))
-        self.assertGreaterEqual(w3, 140)
-        self.assertGreaterEqual(h3, 22)
-
-
 class OneclickStreamerUiTest(unittest.TestCase):
     def test_oneclick_page_contains_streamer_controls(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -91,12 +74,6 @@ class OneclickStreamerUiTest(unittest.TestCase):
         app = QApplication.instance() or QApplication([])
 
         class _DummyApp:
-            def __init__(self):
-                self.synced = []
-
-            def sync_streamer_overlay(self, cfg=None):
-                self.synced.append(cfg)
-
             def run(self, fn, on_done=None, quiet=False):
                 return None
 
@@ -127,9 +104,6 @@ class OneclickStreamerUiTest(unittest.TestCase):
                     page.chk_streamer_mode.setChecked(True)
                     prepare_lobby.assert_called_once_with(True)
                 self.assertEqual(page.badge_streamer.text(), "已开启")
-                self.assertTrue(dummy.synced)
-                self.assertTrue(dummy.synced[-1]["enabled"])
-                self.assertEqual(dummy.synced[-1]["fake_name"], "实时主播ID")
 
                 saved = backend.streamer_load_config()
                 self.assertTrue(saved["enabled"])

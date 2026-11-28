@@ -279,8 +279,6 @@ class MainWindow(QWidget):
 
         self._current = None
         self._workers = []
-        self._streamer_overlay = None
-        self._init_streamer_overlay()
         self.goto("one")
 
         self.timer = QTimer(self)
@@ -290,63 +288,8 @@ class MainWindow(QWidget):
         self._poll()
         # 启动后自动恢复上次开启的加速服务、风险注入守护与武器皮肤配置
         QTimer.singleShot(300, self._auto_restore)
-        # 启动后同步一次直播模式大厅遮罩状态
-        QTimer.singleShot(350, self.sync_streamer_overlay)
         # 启动后延迟 1.5s 静默检测 GitHub 新版本（不阻塞启动）
         QTimer.singleShot(1500, self._auto_check_update)
-
-    def _init_streamer_overlay(self):
-        """懒导入大厅左上角直播模式遮罩，导入失败安全兜底。"""
-        if self._streamer_overlay is not None:
-            return self._streamer_overlay
-        try:
-            import lobby_overlay as _lo
-            cls = getattr(_lo, "LobbyNameOverlay", None)
-            if callable(cls):
-                self._streamer_overlay = cls()
-        except Exception:
-            self._streamer_overlay = None
-        return self._streamer_overlay
-
-    def sync_streamer_overlay(self, cfg=None):
-        """根据直播模式配置启停或刷新大厅左上角防窥遮罩。"""
-        if cfg is None:
-            try:
-                fn = getattr(backend, "streamer_load_config", None)
-                cfg = fn() if callable(fn) else {}
-            except Exception:
-                cfg = {}
-        cfg = cfg if isinstance(cfg, dict) else {}
-        enabled = bool(cfg.get("enabled", False))
-        lobby_overlay = bool(cfg.get("lobby_overlay", cfg.get("lobby_mask", True)))
-        fake_name = str(cfg.get("fake_name") or cfg.get("custom_name") or "神秘玩家").strip() or "神秘玩家"
-
-        ov = self._init_streamer_overlay()
-        if ov is None:
-            return False
-        try:
-            set_cfg = getattr(ov, "set_config", None)
-            if callable(set_cfg):
-                set_cfg(enabled=enabled, fake_name=fake_name, lobby_overlay=lobby_overlay)
-                return bool(enabled and lobby_overlay)
-            if not (enabled and lobby_overlay):
-                stop_fn = getattr(ov, "stop", None)
-                if callable(stop_fn):
-                    stop_fn()
-            return False
-        except Exception:
-            return False
-
-    def _stop_streamer_overlay(self):
-        ov = getattr(self, "_streamer_overlay", None)
-        if ov is None:
-            return
-        try:
-            stop_fn = getattr(ov, "stop", None)
-            if callable(stop_fn):
-                stop_fn()
-        except Exception:
-            pass
 
     def _auto_check_update(self):
         try:
@@ -516,7 +459,6 @@ class MainWindow(QWidget):
                 _app.setQuitOnLastWindowClosed(False)
         except Exception:
             pass
-        self._stop_streamer_overlay()
         self.hide()
         ev.accept()
 

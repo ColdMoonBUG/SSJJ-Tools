@@ -89,12 +89,59 @@ class LobbyStreamerDeltaTest(unittest.TestCase):
             (root / variant).write_bytes(data)
             config = root / "config.json"
             record.write_text(json.dumps({"original": "old.swf", "variant": variant,
-                                          "config_path": str(config)}), encoding="utf8")
+                                          "config_path": str(config),
+                                          "template_sha256": lobby_streamer._TEMPLATE_SHA256}), encoding="utf8")
             result = lobby_streamer.install(paras, root, record, config)
             self.assertTrue(result["already_active"])
             self.assertTrue(lobby_streamer.restore(paras, record))
             self.assertEqual(json.loads(paras.read_text())["serverId"], 7)
             self.assertFalse(record.exists())
+
+    def test_older_variant_is_upgraded_without_changing_game_parameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paras, record, config = root / "paras.dat", root / "record.json", root / "config.json"
+            paras.write_text('{"lobbyFileName":"old.swf","serverId":7}', encoding="utf8")
+            original_paras = paras.read_bytes()
+            old_record = {"original": "old.swf", "variant": "previous.swf", "config_path": str(config)}
+            record.write_text(json.dumps(old_record), encoding="utf8")
+            upgraded = root / "new.swf"
+            with patch.object(lobby_streamer, "prepare_variant", return_value=upgraded) as build:
+                result = lobby_streamer.install(paras, root, record, config)
+            build.assert_called_once_with(root / "old.swf", root, config)
+            self.assertFalse(result["already_active"])
+            self.assertEqual(result["variant"], "new.swf")
+            self.assertEqual(paras.read_bytes(), original_paras)
+            self.assertEqual(json.loads(record.read_text())["template_sha256"],
+                             lobby_streamer._TEMPLATE_SHA256)
+
+    def test_failed_upgrade_keeps_previous_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paras, record, config = root / "paras.dat", root / "record.json", root / "config.json"
+            paras.write_text('{"lobbyFileName":"old.swf"}', encoding="utf8")
+            previous = {"original": "old.swf", "variant": "previous.swf", "config_path": str(config)}
+            record.write_text(json.dumps(previous), encoding="utf8")
+            with patch.object(lobby_streamer, "prepare_variant", side_effect=ValueError("failed")):
+                with self.assertRaises(ValueError):
+                    lobby_streamer.install(paras, root, record, config)
+            self.assertEqual(json.loads(record.read_text()), previous)
+
+    def test_upgrade_preserves_restore_for_legacy_variant_in_game_parameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paras, record, config = root / "paras.dat", root / "record.json", root / "config.json"
+            paras.write_text('{"lobbyFileName":"legacy.swf"}', encoding="utf8")
+            record.write_text(json.dumps({"original": "old.swf", "variant": "legacy.swf",
+                                          "config_path": str(config)}), encoding="utf8")
+            blob = b"updated"
+            name = "Lobby_%s.swf" % __import__("hashlib").md5(blob).hexdigest()
+            (root / name).write_bytes(blob)
+            with patch.object(lobby_streamer, "prepare_variant", return_value=root / name):
+                lobby_streamer.install(paras, root, record, config)
+            self.assertTrue(lobby_streamer.install(paras, root, record, config)["already_active"])
+            self.assertTrue(lobby_streamer.restore(paras, record))
+            self.assertEqual(json.loads(paras.read_text())["lobbyFileName"], "old.swf")
 
     def test_install_does_not_overwrite_change_during_build(self):
         with tempfile.TemporaryDirectory() as directory:

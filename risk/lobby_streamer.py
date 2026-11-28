@@ -15,7 +15,7 @@ import swf_fps
 
 
 _BASE_SHA256 = "eccd118a33474dc495104d416493b21b42e8ab69c141d062b5097b60678adef3"
-_TEMPLATE_SHA256 = "30bea271c128e852c277c13c366e5375288d946a58fb2d2ab72e1e294b210300"
+_TEMPLATE_SHA256 = "e808cd93d70edf95eabbd2f19e67e6cfc425cca81bcb40ad0cf7ae6feb0fb0ed"
 _PLACEHOLDER = b"C:\\__SSJJ_STREAMER_CONFIG__|" + b"~" * 512
 _DELTA = Path(__file__).resolve().parent / "data" / "lobby_streamer_eccd118a.bsdiff"
 
@@ -141,9 +141,22 @@ def install(paras_path, cache_dir, manifest_path, config_path):
         raise ValueError("paras.dat 没有有效的大厅文件名")
     if manifest_path.exists():
         manifest = _read_json(manifest_path)
-        if current in (manifest.get("variant"), manifest.get("original")):
+        if current in (manifest.get("variant"), manifest.get("original"), manifest.get("previous_variant")):
             if manifest.get("config_path") != str(Path(config_path)):
                 raise ValueError("实验大厅使用的配置路径已变化，请先恢复大厅")
+            original_name = manifest.get("original")
+            if not isinstance(original_name, str) or original_name != os.path.basename(original_name):
+                raise ValueError("实验大厅原文件名无效")
+            if manifest.get("template_sha256") != _TEMPLATE_SHA256:
+                variant = prepare_variant(cache_dir / original_name, cache_dir, config_path)
+                if (_read_json(paras_path).get("lobbyFileName") != current
+                        or _read_json(manifest_path) != manifest):
+                    raise ValueError("构建期间大厅配置发生变化，请重试")
+                new_manifest = dict(manifest, variant=variant.name, template_sha256=_TEMPLATE_SHA256)
+                if current != original_name:
+                    new_manifest["previous_variant"] = current
+                _write_json(manifest_path, new_manifest)
+                return {"original": original_name, "variant": variant.name, "already_active": False}
             variant_name = manifest["variant"]
             if not re.fullmatch(r"Lobby_[0-9a-f]{32}\.swf", variant_name):
                 raise ValueError("实验大厅文件名无效")
@@ -157,7 +170,8 @@ def install(paras_path, cache_dir, manifest_path, config_path):
     variant = prepare_variant(original, cache_dir, config_path)
     if _read_json(paras_path).get("lobbyFileName") != current:
         raise ValueError("构建期间大厅配置发生变化，请重试")
-    manifest = {"original": current, "variant": variant.name, "config_path": str(Path(config_path))}
+    manifest = {"original": current, "variant": variant.name, "config_path": str(Path(config_path)),
+                "template_sha256": _TEMPLATE_SHA256}
     _write_json(manifest_path, manifest)
     return {"original": current, "variant": variant.name, "already_active": False}
 
@@ -212,7 +226,11 @@ def restore(paras_path, manifest_path):
         raise ValueError("实验大厅恢复记录无效")
     paras = _read_json(paras_path)
     current = paras.get("lobbyFileName")
-    if current == variant:
+    previous = manifest.get("previous_variant")
+    if previous is not None and (not isinstance(previous, str) or not previous
+                                 or previous != os.path.basename(previous)):
+        raise ValueError("实验大厅恢复记录无效")
+    if current == variant or (previous is not None and current == previous):
         bom = paras_path.read_bytes().startswith(b"\xef\xbb\xbf")
         paras["lobbyFileName"] = original
         _write_json(paras_path, paras, bom=bom)

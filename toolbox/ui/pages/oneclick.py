@@ -251,7 +251,7 @@ class OneclickPage(ScrollPage):
         self.chk_streamer_lobby = QCheckBox("启用大厅昵称显示")
         self.chk_streamer_lobby.setChecked(True)
         self.chk_streamer_lobby.setToolTip(
-            "开启后在大厅窗口左上角昵称区域覆盖防窥遮罩，显示自定义昵称，关闭工具箱自动撤销。")
+            "开启后替换本机大厅和房间内显示的昵称，需要开启本地加速并重新登录微端。")
         sr1.addWidget(self.chk_streamer_mode)
         sr1.addWidget(self.chk_streamer_lobby)
         sr1.addStretch(1)
@@ -272,7 +272,7 @@ class OneclickPage(ScrollPage):
         streamer_card.add_layout(sr2)
 
         sr3 = QHBoxLayout()
-        self.btn_streamer_lobby_test = QPushButton("启用大厅昵称实验")
+        self.btn_streamer_lobby_test = QPushButton("准备大厅昵称")
         self.btn_streamer_lobby_restore = QPushButton("恢复原大厅")
         sr3.addWidget(self.btn_streamer_lobby_test)
         sr3.addWidget(self.btn_streamer_lobby_restore)
@@ -1083,16 +1083,9 @@ class OneclickPage(ScrollPage):
             self.badge_streamer.setText("已开启" if cur_enabled else "未开启")
             self.badge_streamer.state("ok" if cur_enabled else "")
 
-            sync = getattr(self.app, "sync_streamer_overlay", None)
-            if callable(sync):
-                try:
-                    sync(cfg)
-                except Exception as exc:
-                    self.log.line("[!] 同步大厅遮罩失败：%r" % (exc,))
-
             if cur_enabled:
                 self.log.line(
-                    "[OK] 直播模式：已开启（显示昵称：%s · 大厅遮罩：%s · 对局中实时生效）"
+                    "[OK] 直播模式：已开启（显示昵称：%s · 大厅昵称：%s · 对局中实时生效）"
                     % (cur_name, "开" if cur_lobby else "关")
                 )
                 if cur_lobby and self.btn_streamer_lobby_test.isEnabled():

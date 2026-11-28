@@ -1,6 +1,6 @@
 import unittest
 
-from risk.lobby_streamer_prototype import patch_sources
+from risk.lobby_streamer_prototype import patch_sources, patch_join_source
 
 
 PORTRAIT = """   import assets.CommonAssets;
@@ -16,6 +16,12 @@ ROOM = """   import assets.MainAssets;
          _loc2_ = _data.playerName.charAt(0) + "*****";
          teamNameLb.text = "";
          super.dispose();
+"""
+JOIN = """   import lobby.model.ChatProxy;
+      private var _socialProxy:SocialProxy;
+         _loc2_.userJoin(_loc3_);
+         _loc4_.friendJoinMessage(_loc3_.playerName,_loc3_.vipLv);
+         _loc4_.userJoinMessage(_loc3_.playerName,0,_loc3_.vipLv);
 """
 
 
@@ -46,6 +52,17 @@ class LobbyStreamerPrototypeTest(unittest.TestCase):
             self.assertIn("[诊断:配置文件不存在]", source)
             self.assertIn("[诊断:配置读取异常]", source)
             self.assertIn("cfg.enabled && cfg.lobby_overlay", source)
+
+    def test_join_notice_rewrites_only_name_for_matching_character(self):
+        source = patch_join_source(JOIN, r"C:\cfg.json")
+        self.assertIn("characterId == user.userInfo.globalCharId", source)
+        self.assertIn("_loc2_.userJoin(_loc3_);", source)
+        self.assertIn("friendJoinMessage(streamerJoinName(_loc3_.playerName,_loc3_.characterId)", source)
+        self.assertIn("userJoinMessage(streamerJoinName(_loc3_.playerName,_loc3_.characterId)", source)
+        self.assertNotIn("_loc3_.playerName =", source)
+        self.assertIn("return original;", source)
+        with self.assertRaises(ValueError):
+            patch_join_source(JOIN.replace("userJoinMessage", "unknown"), r"C:\cfg.json")
 
 
 if __name__ == "__main__":

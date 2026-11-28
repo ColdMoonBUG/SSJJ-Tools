@@ -14,6 +14,8 @@ from pathlib import Path
 
 _PORTRAIT = "lobby.view.main.SubNewPlayerProtrait"
 _ROOM = "lobby.view.room.TeamCellRenderer"
+_JOIN_ROOM = "lobby.controller.UserJoinRoomCommand"
+_JOIN_GLOBAL_ROOM = "globalRoom.controller.room.UserJoinGRoomCommand"
 
 _IMPORTS = """   import flash.events.Event;
    import flash.utils.getTimer;
@@ -81,8 +83,7 @@ def _once(source, old, new):
     return source.replace(old, new, 1)
 
 
-def patch_sources(portrait, room, config_path, diagnostic=False):
-    """Prepare two AS3 classes; reject unknown layouts before building."""
+def _config_helper(config_path, diagnostic=False):
     path_literal = json.dumps(str(config_path), ensure_ascii=True)
     helper = _HELPER.replace("CONFIG_PATH", path_literal)
     if diagnostic:
@@ -91,6 +92,12 @@ def patch_sources(portrait, room, config_path, diagnostic=False):
         helper = _once(helper, "catch(ignored:Error) {} } }\n         return original;",
                        'catch(ignored:Error) {} } return "[诊断:配置读取异常]"; }\n'
                        "         return original;")
+    return helper
+
+
+def patch_sources(portrait, room, config_path, diagnostic=False):
+    """Prepare two AS3 classes; reject unknown layouts before building."""
+    helper = _config_helper(config_path, diagnostic)
     portrait = _once(portrait, "   import assets.CommonAssets;",
                      _IMPORTS + "   import flash.utils.getDefinitionByName;\n"
                      "   import assets.CommonAssets;")
@@ -125,6 +132,34 @@ def patch_sources(portrait, room, config_path, diagnostic=False):
     return portrait, room
 
 
+def patch_join_source(source, config_path, diagnostic=False):
+    """Replace only the displayed name in the local player's room-entry notice."""
+    helper = _config_helper(config_path, diagnostic)
+    helper += """
+      private function streamerJoinName(original:String, characterId:Number) : String
+      {
+         try
+         {
+            var user:UserProxy = facade.retrieveProxy("UserProxy") as UserProxy;
+            if(user && user.userInfo && characterId == user.userInfo.globalCharId)
+               return streamerName(original);
+         }
+         catch(e:Error) {}
+         return original;
+      }
+"""
+    source = _once(source, "   import lobby.model.ChatProxy;",
+                   "   import flash.utils.getDefinitionByName;\n"
+                   "   import lobby.model.UserProxy;\n"
+                   "   import lobby.model.ChatProxy;")
+    source = _once(source, "      private var _socialProxy:SocialProxy;",
+                   helper + "      private var _socialProxy:SocialProxy;")
+    for method in ("friendJoinMessage", "userJoinMessage"):
+        source = _once(source, "_loc4_.%s(_loc3_.playerName" % method,
+                       "_loc4_.%s(streamerJoinName(_loc3_.playerName,_loc3_.characterId)" % method)
+    return source
+
+
 def _run(args):
     result = subprocess.run(args, capture_output=True, text=True, errors="replace")
     if result.returncode:
@@ -144,18 +179,26 @@ def build_prototype(ffdec, source, output, config_path, diagnostic=False):
         raise ValueError("直播配置路径必须为绝对路径")
     with tempfile.TemporaryDirectory(prefix="ssjj-streamer-") as tmp:
         tmp = Path(tmp)
-        _run([str(ffdec), "-selectclass", _PORTRAIT + "," + _ROOM,
+        _run([str(ffdec), "-selectclass", ",".join((_PORTRAIT, _ROOM, _JOIN_ROOM, _JOIN_GLOBAL_ROOM)),
               "-export", "script", str(tmp / "export"), str(source)])
-        base = tmp / "export" / "scripts" / "lobby" / "view"
-        portrait = (base / "main" / "SubNewPlayerProtrait.as").read_text(encoding="utf-8-sig")
-        room = (base / "room" / "TeamCellRenderer.as").read_text(encoding="utf-8-sig")
+        base = tmp / "export" / "scripts"
+        portrait = (base / "lobby/view/main/SubNewPlayerProtrait.as").read_text(encoding="utf-8-sig")
+        room = (base / "lobby/view/room/TeamCellRenderer.as").read_text(encoding="utf-8-sig")
+        join = (base / "lobby/controller/UserJoinRoomCommand.as").read_text(encoding="utf-8-sig")
+        global_join = (base / "globalRoom/controller/room/UserJoinGRoomCommand.as").read_text(encoding="utf-8-sig")
         portrait, room = patch_sources(portrait, room, config_path, diagnostic=diagnostic)
+        join = patch_join_source(join, config_path, diagnostic=diagnostic)
+        global_join = patch_join_source(global_join, config_path, diagnostic=diagnostic)
         pfile, rfile = tmp / "portrait.as", tmp / "room.as"
+        jfile, gfile = tmp / "join.as", tmp / "global_join.as"
         pfile.write_text(portrait, encoding="utf-8")
         rfile.write_text(room, encoding="utf-8")
+        jfile.write_text(join, encoding="utf-8")
+        gfile.write_text(global_join, encoding="utf-8")
         built = tmp / "result.swf"
         _run([str(ffdec), "-air", "-replace", str(source), str(built),
-              _PORTRAIT, str(pfile), _ROOM, str(rfile)])
+              _PORTRAIT, str(pfile), _ROOM, str(rfile),
+              _JOIN_ROOM, str(jfile), _JOIN_GLOBAL_ROOM, str(gfile)])
         if not built.is_file() or built.stat().st_size == 0:
             raise RuntimeError("FFDec 未生成大厅实验副本")
         output.parent.mkdir(parents=True, exist_ok=True)
