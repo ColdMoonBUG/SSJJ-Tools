@@ -1430,6 +1430,22 @@ def restore_on_startup():
     except Exception:
         pass
 
+    # 默认随已开启的直播模式准备大厅文件。不会中断正在运行的大厅。
+    try:
+        streamer = streamer_load_config()
+        if streamer.get("enabled") and streamer.get("lobby_overlay"):
+            streamer_lobby_experiment(True)
+            logs.append("大厅昵称实验已准备；启动时会检查入口")
+    except Exception as e:
+        logs.append("大厅昵称实验准备失败: %s" % e)
+    try:
+        import diagnostics
+        for line in logs:
+            if line.startswith("大厅昵称实验"):
+                diagnostics.record(line)
+    except Exception:
+        pass
+
     return logs
 
 
@@ -1539,3 +1555,74 @@ def startup_housekeeping():
         pass
 
     return summary
+
+
+# ---------------------------------------------------------------- 直播模式配置
+_STREAMER_DEFAULTS = {
+    "enabled": False,
+    "fake_name": "神秘玩家",
+    "lobby_overlay": True,
+}
+
+
+def streamer_config_path() -> Path:
+    """返回 %LOCALAPPDATA%\\ssjj-toolbox\\streamer_mode.json 路径。"""
+    local_app = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return Path(local_app) / "ssjj-toolbox" / "streamer_mode.json"
+
+
+def streamer_load_config() -> dict:
+    """读取直播模式配置，缺失或损坏时安全返回默认值。"""
+    cfg = dict(_STREAMER_DEFAULTS)
+    path = streamer_config_path()
+    try:
+        if path.is_file():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg["enabled"] = bool(raw.get("enabled", False))
+                name = str(raw.get("fake_name") or "").strip()
+                cfg["fake_name"] = name or _STREAMER_DEFAULTS["fake_name"]
+                cfg["lobby_overlay"] = bool(raw.get("lobby_overlay", True))
+    except Exception:
+        pass
+    return cfg
+
+
+def streamer_save_config(enabled: bool, fake_name: str, lobby_overlay: bool = True):
+    """原子写入直播模式配置（.tmp + os.replace，UTF-8 无 BOM）。
+
+    返回 (True, cfg) 或 (False, err_msg)。
+    """
+    name = str(fake_name or "").strip() or _STREAMER_DEFAULTS["fake_name"]
+    cfg = {
+        "enabled": bool(enabled),
+        "fake_name": name,
+        "lobby_overlay": bool(lobby_overlay),
+    }
+    path = streamer_config_path()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(cfg, ensure_ascii=False, indent=2)
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(payload)
+        os.replace(str(tmp), str(path))
+        return True, cfg
+    except Exception as e:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False, "保存直播模式配置失败：%r" % (e,)
+
+
+def streamer_lobby_experiment(install=True):
+    """选择或恢复实验大厅；只影响下一次启动。"""
+    from risk import lobby_streamer
+    from risk.paths import DATA_ROOT
+
+    record = Path(DATA_ROOT) / "streamer_lobby_experiment.json"
+    if install:
+        return lobby_streamer.install(P.PARAS, P.CACHE_DIR, record, streamer_config_path())
+    return lobby_streamer.restore(P.PARAS, record)

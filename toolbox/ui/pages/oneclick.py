@@ -234,6 +234,60 @@ class OneclickPage(ScrollPage):
         run.add(self.log)
         self.root.addWidget(run)
 
+        # ------------------------------------------------ 直播模式（防窥 / 自定义显示 ID）
+        streamer_card = Card(
+            "直播模式（防窥 / 自定义显示 ID）",
+            "替换本机对局、大厅和房间的显示昵称。",
+            glyph="\uE714",
+        )
+        self.badge_streamer = Badge("未开启")
+        streamer_card.add_header_widget(self.badge_streamer)
+
+        sr1 = QHBoxLayout()
+        sr1.setSpacing(12)
+        self.chk_streamer_mode = QCheckBox("开启直播模式（对局中实时生效）")
+        self.chk_streamer_mode.setToolTip(
+            "开启后战斗端会实时把本机玩家昵称替换为下方自定义昵称，可随时开启或关闭。")
+        self.chk_streamer_lobby = QCheckBox("启用大厅昵称显示")
+        self.chk_streamer_lobby.setChecked(True)
+        self.chk_streamer_lobby.setToolTip(
+            "开启后在大厅窗口左上角昵称区域覆盖防窥遮罩，显示自定义昵称，关闭工具箱自动撤销。")
+        sr1.addWidget(self.chk_streamer_mode)
+        sr1.addWidget(self.chk_streamer_lobby)
+        sr1.addStretch(1)
+        streamer_card.add_layout(sr1)
+
+        sr2 = QHBoxLayout()
+        sr2.setSpacing(8)
+        lb_sn = QLabel("显示昵称")
+        lb_sn.setFixedWidth(56)
+        lb_sn.setObjectName("Dim")
+        sr2.addWidget(lb_sn)
+        self.ed_streamer_name = QLineEdit()
+        self.ed_streamer_name.setPlaceholderText("输入本机显示的自定义昵称（如：神秘玩家）")
+        sr2.addWidget(self.ed_streamer_name, 1)
+        self.btn_streamer_apply = QPushButton("保存并生效")
+        self.btn_streamer_apply.setMinimumHeight(34)
+        sr2.addWidget(self.btn_streamer_apply)
+        streamer_card.add_layout(sr2)
+
+        sr3 = QHBoxLayout()
+        self.btn_streamer_lobby_test = QPushButton("启用大厅昵称实验")
+        self.btn_streamer_lobby_restore = QPushButton("恢复原大厅")
+        sr3.addWidget(self.btn_streamer_lobby_test)
+        sr3.addWidget(self.btn_streamer_lobby_restore)
+        sr3.addStretch(1)
+        streamer_card.add_layout(sr3)
+
+        self.lb_streamer_hint = dim(
+            "大厅昵称需要本地加速，并重新登录微端后生效。"
+            "房间聊天和系统消息可能仍显示真实昵称。",
+            small=True,
+        )
+        self.lb_streamer_hint.setWordWrap(True)
+        streamer_card.add(self.lb_streamer_hint)
+        self.root.addWidget(streamer_card)
+
         # ------------------------------------------------ 第三方自定义 Mod（贴图 / 模型）
         mods_card = Card("⑥ 第三方自定义 Mod（贴图 / 模型）",
                          "零注入资源覆盖（走本地加速清单改写）：可导出原枪贴图(PNG)自制涂装，"
@@ -342,11 +396,11 @@ class OneclickPage(ScrollPage):
         self.root.addWidget(adv)
         self.root.addStretch(1)
 
-        # 顺序：启动游戏 → 选外观 → 当前规则 → 第三方自定义 Mod → 高级（原来的构建顺序是 外观在最前）
+        # 顺序：启动游戏 → 直播模式 → 选外观 → 当前规则 → 第三方自定义 Mod → 高级
         _tail = self.root.takeAt(self.root.count() - 1)
-        for _w in (acc, run, look, rules_card, mods_card, adv):
+        for _w in (acc, run, streamer_card, look, rules_card, mods_card, adv):
             self.root.removeWidget(_w)
-        for _w in (acc, run, look, rules_card, mods_card, adv):
+        for _w in (acc, run, streamer_card, look, rules_card, mods_card, adv):
             self.root.addWidget(_w)
         if _tail is not None:
             self.root.addItem(_tail)
@@ -354,6 +408,12 @@ class OneclickPage(ScrollPage):
         # ------------------------------------------------ 连接
         self.btn_go.clicked.connect(lambda: self._go(swap=True))
         self.btn_plain.clicked.connect(lambda: self._go(swap=False))
+        self.chk_streamer_mode.toggled.connect(lambda _on: self._save_streamer_config(source="toggle"))
+        self.chk_streamer_lobby.toggled.connect(lambda _on: self._save_streamer_config(source="lobby"))
+        self.btn_streamer_apply.clicked.connect(lambda: self._save_streamer_config(source="apply"))
+        self.ed_streamer_name.returnPressed.connect(lambda: self._save_streamer_config(source="apply"))
+        self.btn_streamer_lobby_test.clicked.connect(lambda: self._streamer_lobby_experiment(True))
+        self.btn_streamer_lobby_restore.clicked.connect(lambda: self._streamer_lobby_experiment(False))
         self.btn_add_rule.clicked.connect(self._add_rule)
         self.chk_self_only.toggled.connect(lambda on: self._skin_opt_toggled("self_only", on))
         self.chk_killfeed_sim.toggled.connect(lambda on: self._skin_opt_toggled("killfeed_sim", on))
@@ -403,6 +463,13 @@ class OneclickPage(ScrollPage):
                     skin_cfg = backend.skin_load_rules() or {}
                 except Exception:
                     skin_cfg = {}
+                streamer_cfg = {}
+                try:
+                    fn_st = getattr(backend, "streamer_load_config", None)
+                    if callable(fn_st):
+                        streamer_cfg = fn_st() or {}
+                except Exception:
+                    streamer_cfg = {}
                 mods = self._call_mod_api(
                     ("custom_mods_list", "custom_mod_list", "list_custom_mods"),
                     "list_mods",
@@ -412,6 +479,7 @@ class OneclickPage(ScrollPage):
                     "st": oneclick.status(),
                     "admin": backend.is_admin(),
                     "skin_cfg": skin_cfg,
+                    "streamer_cfg": streamer_cfg,
                     "mods": mods if isinstance(mods, list) else [],
                 }
             except Exception:
@@ -515,6 +583,8 @@ class OneclickPage(ScrollPage):
             _w.blockSignals(False)
         self._mods = list(d.get("mods") or [])
         self._render_mods()
+        if "streamer_cfg" in d:
+            self._sync_streamer_ui(d.get("streamer_cfg") or {})
         # 高级开关同步
         for _w, _v in ((self.chk_cold, st.get("cold_swap", True)),
                        (self.chk_auto, st.get("auto_elevate", False)),
@@ -957,6 +1027,104 @@ class OneclickPage(ScrollPage):
             ok, msg = res if isinstance(res, tuple) else (False, "未知结果")
             self.log.line(("[OK] " if ok else "[!] ") + str(msg))
             self.refresh()
+
+        self.run(job, on_done=done, log=self._emit)
+
+    def _sync_streamer_ui(self, cfg):
+        """把 streamer_mode.json 配置回填到直播模式卡片。"""
+        cfg = cfg if isinstance(cfg, dict) else {}
+        enabled = bool(cfg.get("enabled", False))
+        fake_name = str(cfg.get("fake_name") or cfg.get("custom_name") or "").strip()
+        lobby_overlay = bool(cfg.get("lobby_overlay", cfg.get("lobby_mask", True)))
+
+        self.chk_streamer_mode.blockSignals(True)
+        self.chk_streamer_mode.setChecked(enabled)
+        self.chk_streamer_mode.blockSignals(False)
+
+        self.chk_streamer_lobby.blockSignals(True)
+        self.chk_streamer_lobby.setChecked(lobby_overlay)
+        self.chk_streamer_lobby.blockSignals(False)
+
+        if not self.ed_streamer_name.hasFocus():
+            self.ed_streamer_name.blockSignals(True)
+            self.ed_streamer_name.setText(fake_name)
+            self.ed_streamer_name.blockSignals(False)
+
+        self.badge_streamer.setText("已开启" if enabled else "未开启")
+        self.badge_streamer.state("ok" if enabled else "")
+
+    def _save_streamer_config(self, source="apply"):
+        enabled = bool(self.chk_streamer_mode.isChecked())
+        fake_name = (self.ed_streamer_name.text() or "").strip()
+        lobby_overlay = bool(self.chk_streamer_lobby.isChecked())
+        try:
+            fn = getattr(backend, "streamer_save_config", None)
+            if not callable(fn):
+                self.log.line("[!] 后端未提供直播模式保存接口")
+                return
+            ok, res = fn(enabled=enabled, fake_name=fake_name, lobby_overlay=lobby_overlay)
+            if not ok:
+                self.log.line("[!] 保存直播模式失败：%s" % res)
+                return
+            cfg = res if isinstance(res, dict) else {
+                "enabled": enabled,
+                "fake_name": fake_name or "神秘玩家",
+                "lobby_overlay": lobby_overlay,
+            }
+            cur_enabled = bool(cfg.get("enabled", enabled))
+            cur_name = str(cfg.get("fake_name") or fake_name or "神秘玩家").strip() or "神秘玩家"
+            cur_lobby = bool(cfg.get("lobby_overlay", lobby_overlay))
+
+            if not fake_name and cur_name and not self.ed_streamer_name.hasFocus():
+                self.ed_streamer_name.blockSignals(True)
+                self.ed_streamer_name.setText(cur_name)
+                self.ed_streamer_name.blockSignals(False)
+
+            self.badge_streamer.setText("已开启" if cur_enabled else "未开启")
+            self.badge_streamer.state("ok" if cur_enabled else "")
+
+            sync = getattr(self.app, "sync_streamer_overlay", None)
+            if callable(sync):
+                try:
+                    sync(cfg)
+                except Exception as exc:
+                    self.log.line("[!] 同步大厅遮罩失败：%r" % (exc,))
+
+            if cur_enabled:
+                self.log.line(
+                    "[OK] 直播模式：已开启（显示昵称：%s · 大厅遮罩：%s · 对局中实时生效）"
+                    % (cur_name, "开" if cur_lobby else "关")
+                )
+                if cur_lobby and self.btn_streamer_lobby_test.isEnabled():
+                    self._streamer_lobby_experiment(True)
+            else:
+                self.log.line("[OK] 直播模式：已关闭（已恢复本机原始显示）")
+        except Exception as exc:
+            self.log.line("[!] 保存直播模式失败：%r" % (exc,))
+
+    def _streamer_lobby_experiment(self, install):
+        self.btn_streamer_lobby_test.setEnabled(False)
+        self.btn_streamer_lobby_restore.setEnabled(False)
+        self.log.line("[*] %s大厅昵称实验…" % ("准备" if install else "恢复"))
+
+        def job(_worker):
+            try:
+                return (True, backend.streamer_lobby_experiment(install))
+            except Exception as exc:
+                return (False, str(exc))
+
+        def done(result):
+            self.btn_streamer_lobby_test.setEnabled(True)
+            self.btn_streamer_lobby_restore.setEnabled(True)
+            ok, detail = result or (False, "后台任务未完成")
+            if not ok:
+                self.log.line("[!] 大厅昵称实验失败：%s" % detail)
+            elif install:
+                self.log.line("[*] 已准备大厅昵称，启动本地加速后重新登录微端生效。")
+            elif detail:
+                self.log.line("[OK] 已恢复原大厅设置，重开大厅后生效。")
+            else:
+                self.log.line("[*] 当前没有需要恢复的大厅实验。")
 
         self.run(job, on_done=done, log=self._emit)
 

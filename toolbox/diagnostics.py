@@ -23,7 +23,8 @@ _BASELINE = {}
 _STOP = threading.Event()
 _PROCESSES = ("MicroClient.exe", "WDlauncher.exe", "AirLobbyPreloader.exe",
               "AirAloneChat.exe",
-              "SSJJ_BattleClient_Unity.exe", "UnityCrashHandler64.exe")
+              "SSJJ_BattleClient_Unity.exe", "UnityCrashHandler64.exe",
+              "GameMon.des", "GameMon64.des")
 
 
 def _iso(ts=None):
@@ -130,12 +131,46 @@ def start():
                            (dt.datetime.now().strftime("%Y%m%d-%H%M%S"), os.getpid()))
     record("启动 exe=%s frozen=%s" % (sys.executable, bool(getattr(sys, "frozen", False))))
     threading.Thread(target=_watch_processes, name="ssjj-diagnostic-watch", daemon=True).start()
+    proxy_log = _ROOT / "proxy.log"
+    baseline = _BASELINE.get(str(proxy_log.resolve()))
+    offset = baseline["size"] if baseline else 0
+    threading.Thread(target=_watch_proxy_log, args=(proxy_log, offset),
+                     name="ssjj-diagnostic-proxy-log", daemon=True).start()
 
 
 def finish():
     record("工具箱退出")
     _STOP.set()
 
+
+
+def _read_proxy_updates(path, offset, pending):
+    """Read appended proxy log bytes; preserve partial UTF-8 lines between polls."""
+    try:
+        size = path.stat().st_size
+        if size < offset:
+            offset, pending = 0, b""
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            data = stream.read(256 * 1024)
+            offset = stream.tell()
+    except (FileNotFoundError, OSError):
+        return offset, pending, []
+    chunks = (pending + data).split(b"\n")
+    pending = chunks.pop()
+    if len(pending) > 8192:
+        pending = pending[-8192:]
+    return offset, pending, [line.rstrip(b"\r").decode("utf-8", "replace")
+                             for line in chunks if line.strip()]
+
+
+def _watch_proxy_log(path, offset):
+    pending = b""
+    while not _STOP.is_set():
+        offset, pending, lines = _read_proxy_updates(path, offset, pending)
+        for line in lines:
+            record("代理日志观察时间（轮询，非原始写入时间） " + line)
+        _STOP.wait(0.25)
 
 def _watch_processes():
     try:
@@ -152,21 +187,33 @@ def _watch_processes():
                 info = proc.info
                 if info.get("name") in _PROCESSES:
                     key = (info["pid"], info.get("create_time"))
-                    current[key] = (info.get("name"), info.get("exe"))
-            for key, (name, exe) in current.items():
+                    current[key] = (info.get("name"), info.get("exe"), proc)
+            for key, (name, exe, _proc) in current.items():
                 if key not in previous:
                     record("%s %s pid=%s 创建=%s 路径=%s" %
                            ("进程已存在" if first else "进程启动",
                             name, key[0], _iso(key[1]) if key[1] else "?", exe or "?"))
-            for key, (name, _exe) in previous.items():
+            for key, (name, _exe, proc) in previous.items():
                 if key not in current:
-                    record("进程退出 %s pid=%s 创建=%s" %
-                           (name, key[0], _iso(key[1]) if key[1] else "?"))
+                    record("进程退出 %s pid=%s 创建=%s %s" %
+                           (name, key[0], _iso(key[1]) if key[1] else "?",
+                            _process_exit_status(proc)))
             previous = current
             first = False
         except Exception as exc:
             record("进程监测异常 %r" % exc)
-        _STOP.wait(2)
+        _STOP.wait(1)
+
+
+def _process_exit_status(proc):
+    # Windows may have already discarded the process exit status; never infer one.
+    try:
+        code = proc.wait(timeout=0)
+        if code is None:
+            return "退出码=不可用"
+        return "退出码=%s (0x%08X)" % (code, int(code) & 0xFFFFFFFF)
+    except Exception as exc:
+        return "退出码=不可用(%s)" % type(exc).__name__
 
 
 _SENSITIVE_KEYS = (
@@ -551,6 +598,79 @@ try {
         return "事件日志读取失败: %r" % exc
 
 
+
+def _windows_security_evidence(start_time):
+    """Read relevant Defender/mitigation events, including named fields and untruncated details."""
+    if os.name != "nt":
+        return "仅 Windows 可读取安全事件"
+    script = r"""
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+$from = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:SSJJ_DIAG_FROM).LocalDateTime
+$pattern = '(?i)ssjj|wooduan|battleclient|microclient|gamemon|gameguard|npgg|ssjj-toolbox|_mei[0-9]+[\\/]+risk[\\/]+proxy'
+$channels = @(
+  @{ Name='Microsoft-Windows-Windows Defender/Operational'; Id=@(1116,1117,1118,1119,1120,1121) },
+  @{ Name='Microsoft-Windows-Security-Mitigations/KernelMode'; Id=@() },
+  @{ Name='Microsoft-Windows-Security-Mitigations/UserMode'; Id=@() }
+)
+$keep = '^(?i:Threat Name|Threat ID|ThreatName|ThreatID|Severity Name|Category Name|Detection ID|DetectionID|Path|Process Name|ProcessName|Action Name|ActionName|Action ID|ActionID|Status|Error Code|Error Description|Detection Time|Detection Source Name|Detection Origin Name|Remediation User)$'
+foreach ($ch in $channels) {
+  'EventLog[{0}] window_from={1:o}' -f $ch.Name,$from
+  try {
+    $filter = @{ LogName=$ch.Name; StartTime=$from }
+    if ($ch.Id.Count -gt 0) { $filter.Id = $ch.Id }
+    $count = 0
+    foreach ($e in @(Get-WinEvent -FilterHashtable $filter -MaxEvents 500 -ErrorAction Stop)) {
+      $xml = [xml]$e.ToXml()
+      $fields = @($xml.Event.EventData.Data)
+      $search = (($fields | ForEach-Object { $_.'#text' }) -join ' ') + ' ' + $e.Message
+      if ($search -notmatch $pattern) { continue }
+      '[{0:o}] id={1} provider={2} record={3} level={4} event_pid={5}' -f $e.TimeCreated,$e.Id,$e.ProviderName,$e.RecordId,$e.LevelDisplayName,$e.ProcessId
+      foreach ($field in $fields) {
+        $name = [string]$field.Name
+        if ($name -match $keep -and $name -notmatch '(?i)user') {
+          $value = ([string]$field.'#text' -replace '[\r\n]+',' ').Trim()
+          if ($value.Length -gt 4096) { $value = $value.Substring(0,4096) + ' [截断]' }
+          '  {0}={1}' -f $name,$value
+        }
+      }
+      if ($ch.Name -like '*Security-Mitigations*') {
+        '  message=' + (($e.Message -replace '[\r\n]+',' ').Trim())
+      }
+      $count++
+      if ($count -ge 100) { '  达到 100 条上限'; break }
+    }
+    if ($count -eq 0) { '  无相关事件' }
+  } catch {
+    if ($_.FullyQualifiedErrorId -like '*NoMatchingEventsFound*') { '  无相关事件' }
+    else { '  读取失败: ' + $_.Exception.Message }
+  }
+}
+"""
+    env = os.environ.copy()
+    env["SSJJ_DIAG_FROM"] = str(int(start_time) - 24 * 60 * 60)
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode:
+            return "安全事件查询失败: " + (result.stderr.strip() or "exit=%d" % result.returncode)
+        return result.stdout.strip() or "无匹配安全事件"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "安全事件查询失败: %r" % exc
+
+
+def _toolbox_binary_details():
+    """Identify the actual executable, without reading configuration or command lines."""
+    if not getattr(sys, "frozen", False):
+        return "源码模式；未打包为 EXE"
+    try:
+        p = Path(sys.executable)
+        return "path=%s size=%d sha256=%s" % (p, p.stat().st_size, _hash(p))
+    except OSError as exc:
+        return "工具箱文件不可读: %r" % exc
+
 def _windows_integrity(start_time):
     if os.name != "nt":
         return "仅 Windows 可读取系统状态"
@@ -898,11 +1018,14 @@ def export(destination=None):
                   "Python=%s\n工具箱=%s\n\n" %
                   (_iso(_START), _iso(now), os.getpid(), os_version,
                    platform.python_version(), sys.executable))
+        out.write("===== 工具箱文件标识 =====\n%s\n\n" % redact(_toolbox_binary_details()))
         out.write("===== 游戏文件与代理残留状态 =====\n%s\n\n" % redact(_file_state()))
         out.write("===== Windows 应用程序崩溃事件 =====\n%s\n\n" %
                   redact(_windows_events(_START)))
         out.write("===== Windows VBS 与代码完整性 =====\n%s\n\n" %
                   redact(_windows_integrity(_START)))
+        out.write("===== 相关安全事件（会话前 24 小时至今）=====\n%s\n\n" %
+                  redact(_windows_security_evidence(_START)))
         out.write("=== DLL 加载策略与安全环境探针 ===\n%s\n\n" %
                   redact(_dll_load_policy_probe()))
         out.write("===== 日志来源（各来源保留原始顺序；只截取本次会话新增字节） =====\n")

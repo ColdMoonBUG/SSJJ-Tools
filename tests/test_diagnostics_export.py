@@ -40,16 +40,91 @@ class DiagnosticExportTest(unittest.TestCase):
                  patch.object(diagnostics, "_ROOT", root), \
                  patch.object(diagnostics, "_windows_events", return_value="Faulting module: example.dll"), \
                  patch.object(diagnostics, "_windows_integrity", return_value="VBS status=2"), \
+                 patch.object(diagnostics, "_windows_security_evidence", return_value="Threat Name=Example threat\nPath=file: C:/ssjj-toolbox/hid.dll\nusername=private_user"), \
                  patch.object(diagnostics, "_probe_av_and_mitigations", return_value=["[本机杀软与安全事件]", "  AV: mock"]):
                 self.assertEqual(diagnostics.export(output), str(output.resolve()))
             text = output.read_text(encoding="utf-8")
             self.assertIn("Faulting module: example.dll", text)
             self.assertIn("=== DLL 加载策略与安全环境探针 ===", text)
+            self.assertIn("Threat Name=Example threat", text)
+            self.assertIn("Path=file: C:/ssjj-toolbox/hid.dll", text)
+            self.assertNotIn("private_user", text)
             self.assertIn("traceback line one\n  continued line", text)
             self.assertIn(".ver.dat", text)
             self.assertNotIn("older session", text)
             for secret in ("hunter2", "alice", "secret", "veryprivate", "other=something"):
                 self.assertNotIn(secret, text)
+
+    def test_security_evidence_requests_recent_named_defender_events(self):
+        if diagnostics.os.name != "nt":
+            self.skipTest("Windows security event collection")
+        from types import SimpleNamespace
+        result = SimpleNamespace(returncode=0, stdout="Threat Name=Trojan:Win32/Example\nPath=file: C:/ssjj-toolbox/hid.dll\nAction Name=Quarantine", stderr="")
+        with patch.object(diagnostics.subprocess, "run", return_value=result) as run:
+            output = diagnostics._windows_security_evidence(1700000000)
+        self.assertIn("Threat Name=Trojan:Win32/Example", output)
+        self.assertIn("Action Name=Quarantine", output)
+        args, kwargs = run.call_args
+        self.assertIn("1116,1117,1118", args[0][-1])
+        self.assertIn("$e.ToXml()", args[0][-1])
+        self.assertEqual(kwargs["env"]["SSJJ_DIAG_FROM"], str(1700000000 - 86400))
+        self.assertEqual(kwargs["timeout"], 20)
+
+    def test_security_event_xml_extracts_only_relevant_fields(self):
+        if diagnostics.os.name != "nt":
+            self.skipTest("Windows PowerShell event parsing")
+        real_run = diagnostics.subprocess.run
+        prefix = r'''
+function Get-WinEvent {
+  param($FilterHashtable,$MaxEvents,$ErrorAction)
+  if ($FilterHashtable.LogName -ne 'Microsoft-Windows-Windows Defender/Operational') { return }
+  $e=[pscustomobject]@{ TimeCreated=[datetime]::Now; Id=1116; ProviderName='Defender'; RecordId=12; LevelDisplayName='Warning'; ProcessId=44; Message='ssjj-toolbox detection' }
+  $e | Add-Member ScriptMethod ToXml { return '<Event><EventData><Data Name="Threat Name">Trojan:Win32/Example!ml</Data><Data Name="Path">file: C:\Users\demo\AppData\Local\ssjj-toolbox\hid.dll</Data><Data Name="Action Name">Quarantine</Data><Data Name="Detection User">private_user</Data></EventData></Event>' }
+  return $e
+}
+'''
+        def run_with_fixture(args, **kwargs):
+            args = list(args)
+            args[-1] = prefix + args[-1]
+            return real_run(args, **kwargs)
+        with patch.object(diagnostics.subprocess, "run", side_effect=run_with_fixture):
+            result = diagnostics._windows_security_evidence(1700000000)
+        self.assertIn("Threat Name=Trojan:Win32/Example!ml", result)
+        self.assertIn("Action Name=Quarantine", result)
+        self.assertIn("ssjj-toolbox", result)
+        self.assertNotIn("private_user", result)
+
+    def test_proxy_observer_handles_partial_utf8_and_log_truncation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "proxy.log"
+            old = b"old session\n"
+            path.write_bytes(old)
+            offset = len(old)
+            text = "[proxy] 载荷已加载\n".encode("utf-8")
+            cut = text.index("载".encode("utf-8")) + 1
+            with path.open("ab") as stream:
+                stream.write(text[:cut])
+            offset, pending, lines = diagnostics._read_proxy_updates(path, offset, b"")
+            self.assertEqual(lines, [])
+            with path.open("ab") as stream:
+                stream.write(text[cut:])
+            offset, pending, lines = diagnostics._read_proxy_updates(path, offset, pending)
+            self.assertEqual(lines, ["[proxy] 载荷已加载"])
+            path.write_bytes(b"new\n")
+            offset, pending, lines = diagnostics._read_proxy_updates(path, offset, pending)
+            self.assertEqual(lines, ["new"])
+
+    def test_exit_status_reports_known_and_unknown_without_guessing(self):
+        class Process:
+            def __init__(self, value): self.value = value
+            def wait(self, timeout):
+                self.timeout = timeout
+                return self.value
+        self.assertIn("0xC0000005", diagnostics._process_exit_status(Process(0xC0000005)))
+        self.assertEqual(diagnostics._process_exit_status(Process(None)), "退出码=不可用")
+        class Failure:
+            def wait(self, timeout): raise PermissionError()
+        self.assertIn("不可用(PermissionError)", diagnostics._process_exit_status(Failure()))
 
     def test_redact_myeasylog2_escaped_json_and_preserves_config_keys(self):
         line_escaped = (

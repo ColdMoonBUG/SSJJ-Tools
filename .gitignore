@@ -1,5 +1,6 @@
 # ---- 构建产物 / 大文件：不进版本库 ----
 dist/
+dist-streamer-experiment/
 build/
 _trash/
 _backups/
@@ -41,6 +42,7 @@ risk_config.*.json
 risk_exit_*.txt
 risk_https_seen.json
 upstream.json
+streamer_lobby_experiment.json
 
 # ---- 运行期临时文件 ----
 *.dmp

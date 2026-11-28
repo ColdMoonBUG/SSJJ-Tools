@@ -235,6 +235,8 @@ namespace SsjjRisk
         {
             try
             {
+                // 直播模式独立于换肤规则：无论是否开启换肤均先替换本机击杀/被击杀/助攻昵称
+                StreamerMode.ApplyToKillData(killData, WeaponSwapper.GetLocalPlayerId());
                 ProcessKillData(killData);
             }
             catch (Exception ex)
@@ -345,8 +347,8 @@ namespace SsjjRisk
                 Queue<string> queue = _fContentReceived.GetValue(history) as Queue<string>;
                 if (queue == null) return;
 
-                string killName = GetString(data, _pKillPlayerName);
-                string beKilledName = GetString(data, _pBeKillPlayerName);
+                string killName = StreamerMode.ResolveDisplayName(GetString(data, _pKillPlayerName));
+                string beKilledName = StreamerMode.ResolveDisplayName(GetString(data, _pBeKillPlayerName));
                 string weaponCn = GetWeaponCnName(weaponName);
                 string skinCn = WeaponSwapper.ResolveSkinDisplayName(skinName);
                 if (string.IsNullOrEmpty(skinCn))

@@ -56,6 +56,7 @@ def main(argv=None):
         "--add-data", "%s;risk\\payload" % PAYLOAD,
         # hid.dll 代理（进程内加载通道）。不带这个，点「部署代理」会找不到 DLL。
         "--add-data", "%s;risk\\proxy" % (ROOT / "risk" / "proxy" / "hid.dll"),
+        "--add-data", "%s;risk\\data" % (ROOT / "risk" / "data" / "lobby_streamer_eccd118a.bsdiff"),
         "--add-data", "%s;." % (ROOT / "weapon_catalog.json"),
         # 保留 bundle_index.json 供旧静态记录还原与皮肤目录兜底
         "--add-data", "%s;toolbox\\data" % (ENTRY.parent / "data"),
@@ -74,8 +75,8 @@ def main(argv=None):
     # PyInstaller 静态分析看不到，必须在命令行里逐个点名，否则打包版点「风险」页
     # 直接 ModuleNotFoundError。
     for mod in ("quick_login", "skin_swap", "skin_pack", "custom_mods", "oneclick",
-                "updater", "diagnostics", "ui.diagnostic_export",
-                "risk", "risk.config", "risk.paths", "risk.swfpatch", "risk.airdesc",
+                "lobby_overlay", "updater", "diagnostics", "ui.diagnostic_export",
+                "risk", "risk.config", "risk.paths", "risk.swfpatch", "risk.airdesc", "risk.lobby_streamer",
                 "risk.lobby", "risk.injector", "risk.mitm", "risk.guard",
                 "risk.proxy", "risk.proxy.build_proxy", "risk.privilege",
                 "risk.selftest", "risk.livetest", "risk.__main__",

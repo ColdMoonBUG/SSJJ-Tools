@@ -226,6 +226,7 @@ namespace SsjjRisk
                 catch (Exception ex) { Log("[exit] 安装失败: " + ex.GetType().Name + " " + ex.Message); }
                 WeaponSwapper.Start();
                 KillFeedSimulator.Install();
+                StreamerMode.Install();
                 StartPatchRetry();
                 Log("=== 载荷收工（guard=" + _guardPatched + " ace=" + _acePatched + " exit=" + _exitGuarded + "） ===");
             }
@@ -264,6 +265,7 @@ namespace SsjjRisk
                 Log("[stage] 4/4 开始：装换肤 IL Hook");
                 WeaponSwapper.Start();
                 KillFeedSimulator.Install();
+                StreamerMode.Install();
                 Log("[stage] 4/4 完成");
                 StartPatchRetry();
                 Log("[stage] 分阶段全部完成（本局没被杀，说明这些改动都能过检测）");
@@ -746,9 +748,12 @@ namespace SsjjRisk
             int kf = 0;
             try { kf = KillFeedSimulator.Restore(); }
             catch (Exception e) { Log("[restore] 撤销击杀播报 Hook 失败: " + e.GetType().Name + " " + e.Message); }
+            int sm = 0;
+            try { sm = StreamerMode.Restore(); }
+            catch (Exception e) { Log("[restore] 撤销直播模式 Hook 失败: " + e.GetType().Name + " " + e.Message); }
             int bytes = RestoreAll();
-            Log("[restore] 全部还原完成：detour " + (hooks + kf) + " 个 / 首字节 " + bytes + " 处");
-            return hooks + kf + bytes;
+            Log("[restore] 全部还原完成：detour " + (hooks + kf + sm) + " 个 / 首字节 " + bytes + " 处");
+            return hooks + kf + sm + bytes;
         }
 
         static string name(MethodInfo m) { return m == null ? "?" : m.DeclaringType.Name + "." + m.Name; }

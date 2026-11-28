@@ -749,6 +749,23 @@ def _serve_request(L, tls, head, host, body=b""):
         tls.sendall(L.build_response(502, b"upstream unavailable",
                                      cache_control="no-store"))
         return False
+    if method == "GET" and code == 200:
+        try:
+            from . import lobby_streamer
+            config_path = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                                       "ssjj-toolbox", "streamer_mode.json")
+            updated, state = lobby_streamer.rewrite_bootstrap(
+                path, data, resp_hdrs, os.path.join(DATA_ROOT, "streamer_lobby_experiment.json"),
+                L.CACHE, config_path)
+            if state != "not-target":
+                L.log("STREAMER-BOOTSTRAP %s" % state)
+            if state == "rewritten":
+                data = updated
+                resp_hdrs = [(k, v) for k, v in resp_hdrs
+                             if k.lower() not in ("etag", "content-md5", "digest")]
+        except Exception as e:
+            # Preserve the upstream login response if the optional experiment fails.
+            L.log("STREAMER-BOOTSTRAP error=%s" % type(e).__name__)
     ext = os.path.splitext(path.split("?")[0])[1]
     upstream_ct = ""
     for k, v in resp_hdrs:
